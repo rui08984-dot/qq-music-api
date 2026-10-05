@@ -13,6 +13,8 @@ import getMvByTag from './mv/getMvByTag';
 import getRadioLists from './radio/getRadioLists';
 // getTopLists
 import getTopLists from './rank/getTopLists';
+// recommend: the five recommendation surfaces, all behind a scanned login state
+import recommend from './recommend/recommend';
 // search
 import getHotKey from './search/getHotKey';
 import getSearchByKey from './search/getSearchByKey';
@@ -52,6 +54,8 @@ export default {
   getSingerStarNum,
   // radio
   getRadioLists,
+  // recommend
+  recommend,
   // DigitalAlbum
   getDigitalAlbumLists,
   // music

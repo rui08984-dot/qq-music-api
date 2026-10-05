@@ -357,6 +357,28 @@ export interface QrLoginService {
     token?: string,
     params?: OwnedPlaylistSongsParams,
   ): Promise<Dictionary | null>;
+  getGuessRecommend(token?: string, num?: number): Promise<Dictionary | null>;
+  getRecommendFeed(
+    token?: string,
+    params?: { page?: number; direction?: number; sNum?: number; vCache?: string[] },
+  ): Promise<Dictionary | null>;
+  getRadarRecommend(token?: string, page?: number): Promise<Dictionary | null>;
+  getRecommendPlaylists(token?: string, from?: number, size?: number): Promise<Dictionary | null>;
+  getNewSongs(token?: string, type?: number): Promise<Dictionary | null>;
+  getSimilarSongs(token?: string, songid?: string | number): Promise<Dictionary | null>;
+  getLikeSong(token?: string, songId?: number): Promise<Dictionary | null>;
+  getUnlikeSong(token?: string, songId?: number): Promise<Dictionary | null>;
+  getAddPlaylistSongs(
+    token?: string,
+    dirId?: number,
+    songIds?: number[],
+  ): Promise<Dictionary | null>;
+  getDelPlaylistSongs(
+    token?: string,
+    dirId?: number,
+    songIds?: number[],
+  ): Promise<Dictionary | null>;
+  getCreatePlaylist(token?: string, dirName?: string): Promise<Dictionary | null>;
   getMusicPlay(
     token: string | undefined,
     songmid: string,
@@ -1942,6 +1964,264 @@ const getPlaylists = async (
   );
 };
 
+/**
+ * 推荐面向的五路请求，彼此独立，一条挂了不影响其余四条。
+ *
+ * 五路全部走 auth 通道（Android 指纹 + 扫码凭据），而不是 legacy 的 `u_common`。原因记在这里
+ * 以免后来有人"优化"回匿名通道：legacy 那一支的 `commonParams.uin` 恒为 `"0"` 且不带 cookie，
+ * 实测匿名调 `get_radio_track` 只回 `code: 1000` 与 `tracks: null` —— 推荐本质是个性化的，
+ * 脱了凭据就只剩运营向的通用内容。
+ */
+
+/**
+ * 歌单写操作族：红心（= 写进官方「我喜欢」目录）、往自建歌单加/删歌。
+ *
+ * `param` 形状按上游 `music.asset.PlaylistDetailWrite` 的实约定：`dirId` 是目录号（红心恒 201）、
+ * `tid` 传 0、`v_songInfo` 每项 `{ songId, songType: 0 }`（0 = 普通歌曲）。
+ * 这些都是**写**操作，走的是扫码凭据 —— 匿名调用上游会拒。
+ */
+const LIKE_PLAYLIST_DIR_ID = 201;
+
+const writePlaylistSongs = async (
+  http: AuthHttpClient,
+  auth: AuthSession,
+  dirId: number,
+  songIds: number[],
+  method: 'AddSonglist' | 'DelSonglist',
+): Promise<Dictionary> =>
+  callMusicu(
+    http,
+    auth.device,
+    method === 'AddSonglist' ? 'playlist-add-songs' : 'playlist-del-songs',
+    'music.musicasset.PlaylistDetailWrite',
+    method,
+    {
+      dirId,
+      tid: 0,
+      bFmtUtf8: 1,
+      v_songInfo: songIds.map((songId) => ({ songId, songType: 0 })),
+    },
+    auth.credential,
+  );
+
+const getLikeSong = async (
+  http: AuthHttpClient,
+  auth: AuthSession,
+  songId: number,
+): Promise<Dictionary> =>
+  writePlaylistSongs(http, auth, LIKE_PLAYLIST_DIR_ID, [songId], 'AddSonglist');
+
+const getUnlikeSong = async (
+  http: AuthHttpClient,
+  auth: AuthSession,
+  songId: number,
+): Promise<Dictionary> =>
+  writePlaylistSongs(http, auth, LIKE_PLAYLIST_DIR_ID, [songId], 'DelSonglist');
+
+const getAddPlaylistSongs = async (
+  http: AuthHttpClient,
+  auth: AuthSession,
+  dirId: number,
+  songIds: number[],
+): Promise<Dictionary> => writePlaylistSongs(http, auth, dirId, songIds, 'AddSonglist');
+
+const getDelPlaylistSongs = async (
+  http: AuthHttpClient,
+  auth: AuthSession,
+  dirId: number,
+  songIds: number[],
+): Promise<Dictionary> => writePlaylistSongs(http, auth, dirId, songIds, 'DelSonglist');
+
+/** 新建自建歌单，返回上游原样数据（里面带新目录的 dirId）。 */
+const getCreatePlaylist = async (
+  http: AuthHttpClient,
+  auth: AuthSession,
+  dirName: string,
+): Promise<Dictionary> =>
+  callMusicu(
+    http,
+    auth.device,
+    'playlist-create',
+    'music.musicasset.PlaylistBaseWrite',
+    'AddPlaylist',
+    { dirName },
+    auth.credential,
+  );
+
+/** 官方「猜你喜欢」电台 id。上游同名裸模块 `mb_track_radio_svr` 更脆弱，这里用带命名空间的那支。 */
+const RADIO_GUESS_YOU_LIKE = 99;
+
+/**
+ * 猜你喜欢 —— 也是刷歌的唯一来源。
+ * `num` 上游默认只有 5，要连续刷必须显式调大；这里封顶 100，避免一次把整个电台拉空。
+ */
+const getGuessRecommend = async (
+  http: AuthHttpClient,
+  auth: AuthSession,
+  num = 30,
+  id = RADIO_GUESS_YOU_LIKE,
+): Promise<Dictionary> => {
+  const safeNum = Math.min(100, Math.max(1, Math.floor(num)));
+  return callMusicu(
+    http,
+    auth.device,
+    'get-guess-recommend',
+    'music.radioProxy.MbTrackRadioSvr',
+    'get_radio_track',
+    { id, num: safeNum, from: 0, scene: 0, song_ids: [] },
+    auth.credential,
+  );
+};
+
+/**
+ * 首页推荐信息流。
+ * `v_cache` 是上游的翻页游标：把已曝光的 shelf id 累积进去才能翻页或换一批（`direction: 1`），
+ * 空数组只能拿到首页首批。
+ */
+const getRecommendFeed = async (
+  http: AuthHttpClient,
+  auth: AuthSession,
+  params: { page?: number; direction?: number; sNum?: number; vCache?: string[] } = {},
+): Promise<Dictionary> => {
+  const vCache = Array.isArray(params.vCache) ? params.vCache.map(stringOf).filter(Boolean) : [];
+  return callMusicu(
+    http,
+    auth.device,
+    'get-recommend-feed',
+    'music.recommend.RecommendFeed',
+    'get_recommend_feed',
+    {
+      direction: Math.max(0, Math.floor(params.direction ?? 0)),
+      page: Math.max(0, Math.floor(params.page ?? 0)),
+      s_num: Math.max(0, Math.floor(params.sNum ?? 0)),
+      v_cache: vCache,
+    },
+    auth.credential,
+  );
+};
+
+/**
+ * 雷达：按红心推相似歌与新歌。
+ * 调用方通常不传种子，让上游读当前账号的红心。条目裹在 `VecSongs[].Track` 里，这里摊平一层。
+ */
+const getRadarRecommend = async (
+  http: AuthHttpClient,
+  auth: AuthSession,
+  page = 0,
+  favSongs: string[] = [],
+  entranceSongs: string[] = [],
+): Promise<Dictionary> => {
+  const response = await callMusicu(
+    http,
+    auth.device,
+    'get-radar-recommend',
+    'music.recommend.TrackRelationServer',
+    'GetRadarSong',
+    {
+      Page: Math.max(0, Math.floor(page)),
+      ReqType: 0,
+      FavSongs: favSongs.map(stringOf).filter(Boolean),
+      EntranceSongs: entranceSongs.map(stringOf).filter(Boolean),
+    },
+    auth.credential,
+  );
+  const vecSongs = Array.isArray(response.VecSongs) ? response.VecSongs : [];
+  return {
+    tracks: vecSongs
+      .map((entry) => dictionaryOf(entry).Track)
+      .filter((entry) => isDictionary(entry)),
+    hasMore: response.HasMore === true || numberOf(response.HasMore) === 1,
+    recommendSongIds: Array.isArray(response.RecommendSongIds) ? response.RecommendSongIds : [],
+    baseSongIds: Array.isArray(response.BaseSongIds) ? response.BaseSongIds : [],
+  };
+};
+
+/** 推荐歌单广场。条目裹在 `List[].Playlist.basic` 里，这里摊平成一个数组。 */
+const getRecommendPlaylists = async (
+  http: AuthHttpClient,
+  auth: AuthSession,
+  from = 0,
+  size = 25,
+): Promise<Dictionary> => {
+  const response = await callMusicu(
+    http,
+    auth.device,
+    'get-recommend-playlists',
+    'music.playlist.PlaylistSquare',
+    'GetRecommendFeed',
+    { From: Math.max(0, Math.floor(from)), Size: Math.min(60, Math.max(1, Math.floor(size))) },
+    auth.credential,
+  );
+  const list = Array.isArray(response.List) ? response.List : [];
+  return {
+    playlists: list
+      .map((entry) => dictionaryOf(dictionaryOf(entry).Playlist).basic)
+      .filter((entry) => isDictionary(entry)),
+    hasMore: response.HasMore === true || numberOf(response.HasMore) === 1,
+    fromLimit: response.FromLimit,
+  };
+};
+
+/** 新歌速递。`type`：1 内地 / 2 欧美 / 3 日本 / 4 韩国 / 5 最新 / 6 港台。 */
+const getNewSongs = async (
+  http: AuthHttpClient,
+  auth: AuthSession,
+  type = 5,
+): Promise<Dictionary> => {
+  const response = await callMusicu(
+    http,
+    auth.device,
+    'get-new-songs',
+    'newsong.NewSongServer',
+    'get_new_song_info',
+    { type: Math.max(1, Math.floor(type)) },
+    auth.credential,
+  );
+  return {
+    songs: Array.isArray(response.songlist) ? response.songlist : [],
+    language: response.lan,
+    categories: Array.isArray(response.lanlist) ? response.lanlist : [],
+    songTags: Array.isArray(response.songTagInfoList) ? response.songTagInfoList : [],
+  };
+};
+
+/**
+ * 相似歌曲：从一首种子歌出发。
+ *
+ * 条目裹了三层（`vecSongNew[].songs[].track`），这里摊平成一个数组。这条是**真正跟听歌状态挂钩**的
+ * 推荐——猜你喜欢按账号画像给，相似歌曲按"此刻在听什么"给，两者不能互相替代。
+ *
+ * `param` 只有 `songid` 一个键，实测多带一个 `num` 上游就会回 `code: 10006`（参数错误），
+ * 数量由上游自己定，不要试图传。
+ */
+const getSimilarSongs = async (
+  http: AuthHttpClient,
+  auth: AuthSession,
+  songid: string | number,
+): Promise<Dictionary> => {
+  const numericId = Number(songid);
+  const response = await callMusicu(
+    http,
+    auth.device,
+    'get-similar-songs',
+    'music.recommend.TrackRelationServer',
+    'GetSimilarSongs',
+    Number.isFinite(numericId) && numericId > 0
+      ? { songid: numericId }
+      : { songid: String(songid) },
+    auth.credential,
+  );
+  const groups = Array.isArray(response.vecSongNew) ? response.vecSongNew : [];
+  const tracks = groups.flatMap((group: unknown) => {
+    const rawSongs: unknown = dictionaryOf(group).songs;
+    const songs: unknown[] = Array.isArray(rawSongs) ? (rawSongs as unknown[]) : [];
+    return songs
+      .map((song: unknown) => dictionaryOf(song).track)
+      .filter((track: unknown) => isDictionary(track));
+  });
+  return { tracks, tags: Array.isArray(response.songTagInfoList) ? response.songTagInfoList : [] };
+};
+
 const FAVORITE_ASSET_URL = 'https://c.y.qq.com/fav/fcgi-bin/fcg_get_profile_order_asset.fcg';
 /** `2` selects favourite albums on this CGI; `3` selects favourite playlists. */
 const FAVORITE_ALBUM_REQUEST_TYPE = 2;
@@ -2715,6 +2995,105 @@ class QrLoginServiceImpl implements QrLoginService {
     const auth = await this.authFor(token);
     return auth
       ? withCredentialRejectionMapped(() => getOwnedPlaylistSongs(this.http, auth, params))
+      : null;
+  }
+
+  public async getGuessRecommend(token?: string, num?: number): Promise<Dictionary | null> {
+    const auth = await this.authFor(token);
+    return auth
+      ? withCredentialRejectionMapped(() => getGuessRecommend(this.http, auth, num))
+      : null;
+  }
+
+  public async getRecommendFeed(
+    token?: string,
+    params: { page?: number; direction?: number; sNum?: number; vCache?: string[] } = {},
+  ): Promise<Dictionary | null> {
+    const auth = await this.authFor(token);
+    return auth
+      ? withCredentialRejectionMapped(() => getRecommendFeed(this.http, auth, params))
+      : null;
+  }
+
+  public async getRadarRecommend(token?: string, page?: number): Promise<Dictionary | null> {
+    const auth = await this.authFor(token);
+    return auth
+      ? withCredentialRejectionMapped(() => getRadarRecommend(this.http, auth, page))
+      : null;
+  }
+
+  public async getRecommendPlaylists(
+    token?: string,
+    from?: number,
+    size?: number,
+  ): Promise<Dictionary | null> {
+    const auth = await this.authFor(token);
+    return auth
+      ? withCredentialRejectionMapped(() => getRecommendPlaylists(this.http, auth, from, size))
+      : null;
+  }
+
+  public async getNewSongs(token?: string, type?: number): Promise<Dictionary | null> {
+    const auth = await this.authFor(token);
+    return auth ? withCredentialRejectionMapped(() => getNewSongs(this.http, auth, type)) : null;
+  }
+
+  public async getLikeSong(token?: string, songId?: number): Promise<Dictionary | null> {
+    const auth = await this.authFor(token);
+    return auth
+      ? withCredentialRejectionMapped(() => getLikeSong(this.http, auth, Math.floor(songId ?? 0)))
+      : null;
+  }
+
+  public async getUnlikeSong(token?: string, songId?: number): Promise<Dictionary | null> {
+    const auth = await this.authFor(token);
+    return auth
+      ? withCredentialRejectionMapped(() => getUnlikeSong(this.http, auth, Math.floor(songId ?? 0)))
+      : null;
+  }
+
+  public async getAddPlaylistSongs(
+    token?: string,
+    dirId?: number,
+    songIds?: number[],
+  ): Promise<Dictionary | null> {
+    const auth = await this.authFor(token);
+    return auth
+      ? withCredentialRejectionMapped(() =>
+          getAddPlaylistSongs(this.http, auth, Math.floor(dirId ?? 0), songIds ?? []),
+        )
+      : null;
+  }
+
+  public async getDelPlaylistSongs(
+    token?: string,
+    dirId?: number,
+    songIds?: number[],
+  ): Promise<Dictionary | null> {
+    const auth = await this.authFor(token);
+    return auth
+      ? withCredentialRejectionMapped(() =>
+          getDelPlaylistSongs(this.http, auth, Math.floor(dirId ?? 0), songIds ?? []),
+        )
+      : null;
+  }
+
+  public async getCreatePlaylist(token?: string, dirName?: string): Promise<Dictionary | null> {
+    const auth = await this.authFor(token);
+    return auth
+      ? withCredentialRejectionMapped(() =>
+          getCreatePlaylist(this.http, auth, String(dirName ?? '').trim()),
+        )
+      : null;
+  }
+
+  public async getSimilarSongs(
+    token?: string,
+    songid?: string | number,
+  ): Promise<Dictionary | null> {
+    const auth = await this.authFor(token);
+    return auth
+      ? withCredentialRejectionMapped(() => getSimilarSongs(this.http, auth, songid ?? ''))
       : null;
   }
 

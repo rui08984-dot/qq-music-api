@@ -37,6 +37,18 @@ import getUserAlbums from './getUserAlbums';
 import getUserLikedSongs from './getUserLikedSongs';
 import getUserPlaylist from './getUserPlaylist';
 import { loginStatus, logout, qrCancel, qrCheck, qrCreate, qrKey, userDetail } from './login';
+import {
+  createPlaylist,
+  guessRecommend,
+  likeSong,
+  newSongs,
+  playlistSongs,
+  radarRecommend,
+  recommendFeed,
+  recommendPlaylists,
+  similarSongs,
+  unlikeSong,
+} from './recommend';
 
 const { get: getCookie, set: setCookie } = cookies;
 
@@ -70,6 +82,16 @@ export default {
   getAlbumInfo: withControllerLogging('getAlbumInfo', getAlbumInfo),
   getComments: withControllerLogging('getComments', getComments),
   getRecommend: withControllerLogging('getRecommend', getRecommend),
+  guessRecommend: withControllerLogging('guessRecommend', guessRecommend),
+  recommendFeed: withControllerLogging('recommendFeed', recommendFeed),
+  radarRecommend: withControllerLogging('radarRecommend', radarRecommend),
+  recommendPlaylists: withControllerLogging('recommendPlaylists', recommendPlaylists),
+  newSongs: withControllerLogging('newSongs', newSongs),
+  similarSongs: withControllerLogging('similarSongs', similarSongs),
+  likeSong: withControllerLogging('likeSong', likeSong),
+  unlikeSong: withControllerLogging('unlikeSong', unlikeSong),
+  playlistSongs: withControllerLogging('playlistSongs', playlistSongs),
+  createPlaylist: withControllerLogging('createPlaylist', createPlaylist),
   getMvPlay: withControllerLogging('getMvPlay', getMvPlay),
   getTopLists: withControllerLogging('getTopLists', getTopLists),
   getRanks: withControllerLogging('getRanks', getRanks),
