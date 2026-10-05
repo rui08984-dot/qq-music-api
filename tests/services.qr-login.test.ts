@@ -17,6 +17,7 @@ import {
   type QrLoginChannel,
   type QrLoginService,
   QrLoginServiceError,
+  type SessionResolver,
 } from '../src/services/auth/qrLogin';
 import type { StreamUrlProbe } from '../src/services/auth/streamCdnSelector';
 import { AuthCredentialRejectedError } from '../src/util/authError';
@@ -61,6 +62,7 @@ interface HarnessOptions {
   listenerReadyFailure?: string;
   sessionFailure?: unknown;
   qrFailure?: unknown;
+  sessionResolver?: SessionResolver;
   mqttConnect?: MqttConnect;
   /** The exchanged WeChat key is rejected with safe code 1000 until refreshed. */
   wechatNeedsRefresh?: boolean;
@@ -398,6 +400,7 @@ const createProtocolHarness = (options: HarnessOptions = {}) => {
     streamUrlProbe: options.streamUrlProbe,
     deviceRepository,
     authSessionRepository: options.authSessionRepository,
+    sessionResolver: options.sessionResolver,
     createSessionHttp: () => wechat.client,
     now: options.now,
     randomBytes: (size) => Buffer.alloc(size, 7),
@@ -577,6 +580,34 @@ describe('QQ QR session teardown', () => {
 });
 
 describe('QQ QR startup diagnostics', () => {
+  it('should remove untrusted diagnostic fields from a restored QR record', async () => {
+    const service = createQrLoginService({
+      qrSessionRepository: {
+        kind: 'test',
+        save: () => undefined,
+        load: () => [
+          {
+            key: 'key',
+            channel: 'qq',
+            state: 'failed',
+            createdAt: Date.now(),
+            expiresAt: Date.now() + 60000,
+            failureStage: 'private-token',
+            failureReason: 'private-cookie',
+            upstreamCode: 'private-account',
+            upstreamHttpStatus: 999,
+            upstreamGlobalCode: Number.NaN,
+            upstreamSubCode: Number.POSITIVE_INFINITY,
+          },
+        ],
+      },
+    });
+    const result = await service.checkQr('key');
+    expect(result.code).toBe(800);
+    expect(JSON.stringify(result)).not.toMatch(/private-|999/);
+    expect(result).not.toHaveProperty('upstreamHttpStatus', 999);
+  });
+
   it('should retain QIMEI failure codes in the first error and the subsequent backoff', async () => {
     const harness = createProtocolHarness({
       qimei: () => response({ code: -30002, data: JSON.stringify({ code: -99 }) }),
