@@ -2106,6 +2106,9 @@ class QrLoginServiceImpl implements QrLoginService {
   }
 
   private dropSession(session: QrSessionRecord): void {
+    // Closing MQTT rejects the listener's pending read. Retire the session first so its late
+    // events and rejection cannot turn intentional teardown into another login failure.
+    if (!terminalState(session.state)) session.state = 'expired';
     const runtime = this.qrRuntimes.get(session.key);
     runtime?.listener?.close();
     runtime?.driver.close(session);
