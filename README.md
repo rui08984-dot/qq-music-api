@@ -100,6 +100,8 @@ qqMusic.configureAuthSessionRepository({
 
 服务同一时间只允许一个 QR 会话。新会话会接管尚未扫码的旧会话；上游要求退避时，响应会提供 `Retry-After`。
 
+`/login/qr/check` 返回 `800` 时，可附带 `failureStage`、`failureReason`、`upstreamCode` 和 `retryAfterMs`，供调用方记录失败原因；不会返回原始异常或登录凭证。
+
 ## API Explorer
 
 Explorer 会根据 `/explorer/metadata` 动态生成接口列表和请求表单，支持方法筛选、搜索、响应预览与当前页面会话的请求日志。

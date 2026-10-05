@@ -1,6 +1,8 @@
 ## 未发布
 
-暂无。
+### 改进
+
+- `/login/qr/check` 的失败响应增加阶段与原因代码，便于排查扫码、MQTT 和凭据校验失败；不暴露原始异常或登录凭证。
 
 ## [3.1.2](https://github.com/yakult-green-tea/qq-music-api/compare/v3.1.1...v3.1.2) (2026-09-12)
 

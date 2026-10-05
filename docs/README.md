@@ -1298,6 +1298,8 @@ songs: [
 
 服务只允许一个并行 QR。上游拒绝（包括安全数字码 `50006`）会保留为 `upstreamCode`，并返回 `retryAfterMs` / `Retry-After`，调用方应等待后重新出码。
 
+`/login/qr/check` 返回 `800` 时，还可能附 `failureStage` 和 `failureReason`。两者是固定代码，例如 `mqtt-listener` / `mqtt-websocket-closed` 或 `credential-validation` / `upstream-rejected`；未知错误统一为 `unexpected-error`，不回传异常原文或凭证。调用方可连同 `upstreamCode`、`retryAfterMs` 一起写入脱敏诊断日志。
+
 #### 实际验收与故障诊断
 
 2026-08-04 使用正式 auth service 完成真实扫码：`801 waiting → 802 scanned → 803 confirmed`；credential exchange 与 `GetLoginUserInfo` 均返回 HTTP 200 / code 0。测试账号返回了有效 profile，但上游昵称字段为空，调用方不应把昵称当作登录成功的唯一判断条件。
