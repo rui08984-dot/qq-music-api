@@ -2121,14 +2121,55 @@ const upstreamHttpStatusOf = (error: unknown): number | undefined => {
   return status !== undefined && status >= 100 && status <= 599 ? status : undefined;
 };
 
-/** Select only public diagnostic fields; never copy the session, error or HTTP body. */
+const QR_FAILURE_STAGES = new Set<string>([
+  'qr-key',
+  'device-bootstrap',
+  'session-bootstrap',
+  'qr-create',
+  'mqtt-listener',
+  'qr-poll',
+  'qr-event',
+  'credential-payload',
+  'credential-exchange',
+  'credential-validation',
+  'session-issue',
+]);
+const QR_FAILURE_REASONS = new Set<string>([
+  'local-backoff',
+  'session-busy',
+  'upstream-http-error',
+  'upstream-rejected',
+  'mqtt-websocket-error',
+  'mqtt-websocket-closed',
+  'mqtt-packet-timeout',
+  'mqtt-handshake-timeout',
+  'mqtt-handshake-failed',
+  'missing-credential',
+  'network-timeout',
+  'dns-error',
+  'connection-reset',
+  'connection-refused',
+  'network-error',
+  'login-rejected',
+  'user-canceled',
+  'qr-timeout',
+  'unexpected-error',
+]);
+
+/** Restored records are untrusted. Select and validate only public diagnostic fields. */
 const failureDetailsOf = (source: QrFailureDetails): QrFailureDetails => ({
-  failureStage: source.failureStage,
-  failureReason: source.failureReason,
-  upstreamHttpStatus: source.upstreamHttpStatus,
-  upstreamCode: source.upstreamCode,
-  upstreamGlobalCode: source.upstreamGlobalCode,
-  upstreamSubCode: source.upstreamSubCode,
+  failureStage:
+    source.failureStage && QR_FAILURE_STAGES.has(source.failureStage)
+      ? source.failureStage
+      : undefined,
+  failureReason:
+    source.failureReason && QR_FAILURE_REASONS.has(source.failureReason)
+      ? source.failureReason
+      : undefined,
+  upstreamHttpStatus: upstreamHttpStatusOf({ httpStatus: source.upstreamHttpStatus }),
+  upstreamCode: safeDiagnosticNumber(source.upstreamCode),
+  upstreamGlobalCode: safeDiagnosticNumber(source.upstreamGlobalCode),
+  upstreamSubCode: safeDiagnosticNumber(source.upstreamSubCode),
 });
 
 const qrFailureDetailsOf = (error: unknown, stage: QrFailureStage): QrFailureDetails => ({
