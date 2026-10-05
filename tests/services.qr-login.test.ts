@@ -585,6 +585,38 @@ describe('QQ native QR login service', () => {
     expect(JSON.stringify(result)).not.toContain(key);
   });
 
+  it('should identify a QR login rejection delivered by the MQTT event', async () => {
+    const harness = createProtocolHarness();
+    const key = await harness.service.createSession();
+    await harness.service.createQr(key);
+    harness.emit({ type: 'scanned', payload: {} });
+    harness.emit({ type: 'loginFailed', payload: null });
+
+    expect(await harness.service.checkQr(key)).toMatchObject({
+      code: 800,
+      failureStage: 'qr-event',
+      failureReason: 'login-rejected',
+    });
+  });
+
+  it('should identify a missing credential without returning the MQTT payload', async () => {
+    const harness = createProtocolHarness();
+    const key = await harness.service.createSession();
+    await harness.service.createQr(key);
+    harness.emit({
+      type: 'cookies',
+      payload: { cookies: { qqmusic_key: { value: 'private-key' } } },
+    });
+    await waitFor(async () => (await harness.service.checkQr(key)).code === 800);
+
+    const result = await harness.service.checkQr(key);
+    expect(result).toMatchObject({
+      failureStage: 'credential-payload',
+      failureReason: 'missing-credential',
+    });
+    expect(JSON.stringify(result)).not.toContain('private-key');
+  });
+
   it('should expose authenticated user and playlist without exposing credentials', async () => {
     const harness = createProtocolHarness();
     const { result } = await login(harness.service, harness.emit);

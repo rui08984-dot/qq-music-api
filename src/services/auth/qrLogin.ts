@@ -148,7 +148,37 @@ export interface QrSessionRecord {
   authToken?: string;
   upstreamCode?: number;
   retryAfterMs?: number;
+  failureStage?: QrFailureStage;
+  failureReason?: QrFailureReason;
 }
+
+type QrFailureStage =
+  | 'qr-create'
+  | 'mqtt-listener'
+  | 'qr-poll'
+  | 'qr-event'
+  | 'credential-payload'
+  | 'credential-exchange'
+  | 'credential-validation'
+  | 'session-issue';
+
+type QrFailureReason =
+  | 'upstream-rejected'
+  | 'mqtt-websocket-error'
+  | 'mqtt-websocket-closed'
+  | 'mqtt-packet-timeout'
+  | 'mqtt-handshake-timeout'
+  | 'mqtt-handshake-failed'
+  | 'missing-credential'
+  | 'network-timeout'
+  | 'dns-error'
+  | 'connection-reset'
+  | 'connection-refused'
+  | 'network-error'
+  | 'login-rejected'
+  | 'user-canceled'
+  | 'qr-timeout'
+  | 'unexpected-error';
 
 /**
  * Process-local handles for one QR session. They die with the process, which is exactly why they
@@ -292,6 +322,8 @@ export interface QrCheckResult {
   cookie?: string;
   upstreamCode?: number;
   retryAfterMs?: number;
+  failureStage?: QrFailureStage;
+  failureReason?: QrFailureReason;
 }
 
 export interface QrLoginService {
@@ -2032,6 +2064,29 @@ const upstreamCodeOf = (error: unknown): number | undefined => {
   return undefined;
 };
 
+/** Only stable, non-sensitive error categories cross the API boundary. */
+const qrFailureReasonOf = (error: unknown): QrFailureReason => {
+  if (error instanceof QqProtocolError || error instanceof WechatQrError)
+    return 'upstream-rejected';
+  const message = error instanceof Error ? error.message : '';
+  const knownMessages: Record<string, QrFailureReason> = {
+    'MQTT WebSocket error': 'mqtt-websocket-error',
+    'MQTT WebSocket closed': 'mqtt-websocket-closed',
+    'MQTT packet timeout': 'mqtt-packet-timeout',
+    'MQTT handshake timeout': 'mqtt-handshake-timeout',
+    'MQTT handshake failed': 'mqtt-handshake-failed',
+    'MQTT cookies missing login credential': 'missing-credential',
+  };
+  if (knownMessages[message]) return knownMessages[message];
+  const code = dictionaryOf(error).code;
+  if (code === 'ETIMEDOUT' || code === 'ECONNABORTED') return 'network-timeout';
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'dns-error';
+  if (code === 'ECONNRESET') return 'connection-reset';
+  if (code === 'ECONNREFUSED') return 'connection-refused';
+  if (code === 'ERR_NETWORK') return 'network-error';
+  return 'unexpected-error';
+};
+
 type QrListenerFactory = (
   qrcodeId: string,
   onEvent: (event: QrEvent) => void,
@@ -2185,22 +2240,27 @@ class QrLoginServiceImpl implements QrLoginService {
     return new QrLoginServiceError('Unable to start QR login', 502, retryAfterMs, upstreamCode);
   }
 
-  private failSession(session: QrSessionRecord, error: unknown): void {
+  private failSession(session: QrSessionRecord, error: unknown, stage: QrFailureStage): void {
     if (terminalState(session.state)) return;
     session.state = 'failed';
     session.upstreamCode = upstreamCodeOf(error);
     session.retryAfterMs = this.backoff();
+    session.failureStage = stage;
+    session.failureReason = qrFailureReasonOf(error);
     this.qrSessionStore.persist();
     logger.warn('qq-auth.session-failed', {
       loginChannel: session.channel,
       upstreamCode: session.upstreamCode,
       retryAfterMs: session.retryAfterMs,
+      failureStage: session.failureStage,
+      failureReason: session.failureReason,
       name: error instanceof Error ? error.name : 'Error',
     });
   }
 
   /** QQ App channel: the MQTT payload carries an exchange token, never the final credential. */
   private async exchangeQqLogin(session: QrSessionRecord, payload: unknown): Promise<QqCredential> {
+    session.failureStage = 'credential-payload';
     const cookies = dictionaryOf(dictionaryOf(payload).cookies);
     const musicid = stringOf(dictionaryOf(cookies.qqmusic_uin).value);
     const mqttToken = stringOf(dictionaryOf(cookies.qqmusic_key).value);
@@ -2208,9 +2268,11 @@ class QrLoginServiceImpl implements QrLoginService {
       throw new Error('MQTT cookies missing login credential');
     session.state = 'exchanging';
     const device = this.deviceStore.get();
+    session.failureStage = 'credential-exchange';
     try {
       return await exchangeCredential(this.http, device, session.qrcodeId, musicid, mqttToken);
     } catch (error) {
+      session.failureStage = 'credential-validation';
       const direct = {
         musicid,
         str_musicid: musicid,
@@ -2248,12 +2310,15 @@ class QrLoginServiceImpl implements QrLoginService {
         : await this.exchangeQqLogin(session, payload);
     if (session.channel === 'wechat')
       credential = await validateWechatCredential(this.http, this.deviceStore.get(), credential);
+    session.failureStage = 'session-issue';
     const token = await this.sessionResolver.issue({
       credential,
       device: this.deviceStore.get(),
       expiresAt: authSessionExpiryAt(credential, this.now()),
     });
     session.authToken = token;
+    session.failureStage = undefined;
+    session.failureReason = undefined;
     session.state = 'confirmed';
     this.qrSessionStore.persist();
     this.failureCount = 0;
@@ -2277,12 +2342,19 @@ class QrLoginServiceImpl implements QrLoginService {
       // background exactly as before; a pull channel awaits it inside the same `advance()` so an
       // invocation never ends with the credential exchange still in flight.
       runtime.finalizing = this.finalizeLogin(session, event.payload).catch((error) =>
-        this.failSession(session, error),
+        this.failSession(session, error, session.failureStage ?? 'credential-exchange'),
       );
       void runtime.finalizing;
     } else if (['canceled', 'timeout', 'loginFailed'].includes(event.type ?? '')) {
       session.state = 'expired';
       session.retryAfterMs = this.backoff();
+      session.failureStage = 'qr-event';
+      session.failureReason =
+        event.type === 'canceled'
+          ? 'user-canceled'
+          : event.type === 'timeout'
+            ? 'qr-timeout'
+            : 'login-rejected';
     }
     this.qrSessionStore.persist();
   }
@@ -2302,7 +2374,8 @@ class QrLoginServiceImpl implements QrLoginService {
       // A dropped long poll is normal; only a run of them fails the session. This is the same
       // tolerance the self-driving WeChat loop applied before it became a pull driver.
       runtime.pollErrors += 1;
-      if (runtime.pollErrors > MAX_CONSECUTIVE_POLL_ERRORS) this.failSession(session, error);
+      if (runtime.pollErrors > MAX_CONSECUTIVE_POLL_ERRORS)
+        this.failSession(session, error, 'qr-poll');
       return;
     }
     for (const event of events) this.onQrEvent(session, event);
@@ -2399,7 +2472,7 @@ class QrLoginServiceImpl implements QrLoginService {
           timeoutMs: session.expiresAt - this.now(),
         });
         runtime.listener = listener;
-        void listener.done.catch((error) => this.failSession(session, error));
+        void listener.done.catch((error) => this.failSession(session, error, 'mqtt-listener'));
         await listener.ready;
       } else {
         // A pull channel is scannable the moment the code exists. The self-driving loop it
@@ -2409,7 +2482,7 @@ class QrLoginServiceImpl implements QrLoginService {
       this.qrSessionStore.persist();
       return qr.imageUrl;
     } catch (error) {
-      this.failSession(session, error);
+      this.failSession(session, error, 'qr-create');
       throw new QrLoginServiceError('Unable to create QR login', 502, session.retryAfterMs);
     }
   }
@@ -2441,6 +2514,8 @@ class QrLoginServiceImpl implements QrLoginService {
       message: session.state === 'expired' ? 'QR code expired' : 'QR login failed',
       ...(session.upstreamCode === undefined ? {} : { upstreamCode: session.upstreamCode }),
       ...(session.retryAfterMs === undefined ? {} : { retryAfterMs: session.retryAfterMs }),
+      ...(session.failureStage === undefined ? {} : { failureStage: session.failureStage }),
+      ...(session.failureReason === undefined ? {} : { failureReason: session.failureReason }),
     };
   }
 
