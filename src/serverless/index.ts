@@ -131,6 +131,7 @@ const serviceErrorResponse = (error: unknown): Response => {
         message: error.message,
         retryAfterMs: error.retryAfterMs,
         ...(error.upstreamCode === undefined ? {} : { upstreamCode: error.upstreamCode }),
+        ...error.diagnostics,
       },
       error.httpStatus,
       error.retryAfterMs

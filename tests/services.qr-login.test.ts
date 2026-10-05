@@ -14,9 +14,11 @@ import {
   createMqttListenOver,
   createQrLoginService,
   type MqttConnect,
+  QqProtocolError,
   type QrLoginChannel,
   type QrLoginService,
   QrLoginServiceError,
+  type SessionResolver,
 } from '../src/services/auth/qrLogin';
 import type { StreamUrlProbe } from '../src/services/auth/streamCdnSelector';
 import { AuthCredentialRejectedError } from '../src/util/authError';
@@ -57,6 +59,11 @@ const wxStatusBody = (errcode: number, code = ''): string =>
 
 interface HarnessOptions {
   failCredential?: boolean;
+  listenerFailure?: string;
+  listenerReadyFailure?: string;
+  sessionFailure?: unknown;
+  qrFailure?: unknown;
+  sessionResolver?: SessionResolver;
   mqttConnect?: MqttConnect;
   /** The exchanged WeChat key is rejected with safe code 1000 until refreshed. */
   wechatNeedsRefresh?: boolean;
@@ -162,12 +169,14 @@ const createProtocolHarness = (options: HarnessOptions = {}) => {
       calls.push(method);
       comms.push(dictionaryOf(dictionaryOf(payload).comm));
       if (method === 'GetSession') {
+        if (options.sessionFailure) throw options.sessionFailure;
         return response({
           code: 0,
           req_0: { code: 0, data: { session: { uid: 1234567890, sid: 'session-sid' } } },
         } as T);
       }
       if (method === 'CreateQRCode') {
+        if (options.qrFailure) throw options.qrFailure;
         const png = Buffer.from('89504e470d0a1a0a01020304', 'hex').toString('base64');
         return response({
           code: 0,
@@ -384,6 +393,7 @@ const createProtocolHarness = (options: HarnessOptions = {}) => {
     post: post as unknown as AuthHttpClient['post'],
   };
   let emit: ((event: TestQrEvent) => void) | undefined;
+  let rejectListener: ((error: Error) => void) | undefined;
   let closed = false;
   const wechat = createWechatHttpStub(options);
   const service = createQrLoginService({
@@ -391,6 +401,7 @@ const createProtocolHarness = (options: HarnessOptions = {}) => {
     streamUrlProbe: options.streamUrlProbe,
     deviceRepository,
     authSessionRepository: options.authSessionRepository,
+    sessionResolver: options.sessionResolver,
     createSessionHttp: () => wechat.client,
     now: options.now,
     randomBytes: (size) => Buffer.alloc(size, 7),
@@ -400,8 +411,12 @@ const createProtocolHarness = (options: HarnessOptions = {}) => {
         return createMqttListenOver(options.mqttConnect)(qrcodeId, onEvent, timeoutMs);
       onEvent({ type: 'waiting', payload: null });
       return {
-        ready: Promise.resolve(),
-        done: new Promise<void>(() => undefined),
+        ready: options.listenerReadyFailure
+          ? Promise.reject(new Error(options.listenerReadyFailure))
+          : Promise.resolve(),
+        done: new Promise<void>((_resolve, reject) => {
+          rejectListener = reject;
+        }),
         close: () => {
           closed = true;
         },
@@ -420,6 +435,10 @@ const createProtocolHarness = (options: HarnessOptions = {}) => {
     emit: (event: TestQrEvent) => {
       if (!emit) throw new Error('listener not started');
       emit(event);
+    },
+    failListener: () => {
+      if (!rejectListener) throw new Error('listener not started');
+      rejectListener(new Error(options.listenerFailure ?? 'MQTT WebSocket closed'));
     },
     wasClosed: () => closed,
   };
@@ -535,6 +554,10 @@ describe('QQ QR session teardown', () => {
       await expect(harness.service.createSession()).rejects.toMatchObject({
         httpStatus: 429,
         retryAfterMs: 30000,
+        diagnostics: {
+          failureReason: 'local-backoff',
+          lastFailure: { failureStage: 'qr-event', failureReason: 'qr-timeout' },
+        },
       });
     } finally {
       mqtt.close();
@@ -558,6 +581,294 @@ describe('QQ QR session teardown', () => {
     } finally {
       mqtt.close();
     }
+  });
+});
+
+describe('QQ QR startup diagnostics', () => {
+  it.each([
+    99, 100, 599, 600, 200.5,
+  ])('should validate restored HTTP status %s independently of signed upstream codes', async (status) => {
+    const service = createQrLoginService({
+      qrSessionRepository: {
+        kind: 'test',
+        save: () => undefined,
+        load: () => [
+          {
+            key: 'key',
+            channel: 'qq',
+            state: 'failed',
+            createdAt: Date.now(),
+            expiresAt: Date.now() + 60000,
+            failureStage: 'qr-create',
+            failureReason: 'upstream-rejected',
+            upstreamHttpStatus: status,
+            upstreamCode: -30002,
+            upstreamGlobalCode: 0,
+            upstreamSubCode: -99,
+          },
+        ],
+      },
+    });
+    const result = await service.checkQr('key');
+    expect(result.upstreamCode).toBe(-30002);
+    expect(result.upstreamHttpStatus).toBe(status === 100 || status === 599 ? status : undefined);
+  });
+
+  it('should classify a thrown primitive as unknown without exposing its content', async () => {
+    const harness = createProtocolHarness({
+      qimei: () => {
+        throw 'private-token';
+      },
+    });
+    const result = await harness.service.createSession().catch((error: unknown) => error);
+    expect(result).toMatchObject({
+      diagnostics: { failureStage: 'device-bootstrap', failureReason: 'unexpected-error' },
+    });
+    expect(JSON.stringify(result)).not.toContain('private-token');
+  });
+
+  it.each([
+    ['MQTT WebSocket error', 'mqtt-websocket-error'],
+    ['MQTT WebSocket closed', 'mqtt-websocket-closed'],
+    ['MQTT packet timeout', 'mqtt-packet-timeout'],
+    ['MQTT handshake timeout', 'mqtt-handshake-timeout'],
+    ['MQTT handshake failed', 'mqtt-handshake-failed'],
+    ['constructor', 'unexpected-error'],
+    ['private-token and private-cookie', 'unexpected-error'],
+  ])('should map listener error %s to a fixed category', async (message, reason) => {
+    const harness = createProtocolHarness({ listenerFailure: message });
+    const key = await harness.service.createSession();
+    await harness.service.createQr(key);
+    harness.failListener();
+    await settleMqttClose();
+    const result = await harness.service.checkQr(key);
+    expect(result).toMatchObject({ failureStage: 'mqtt-listener', failureReason: reason });
+    expect(JSON.stringify(result)).not.toMatch(/private-token|private-cookie/);
+  });
+
+  it.each([
+    ['ETIMEDOUT', 'network-timeout'],
+    ['ECONNABORTED', 'network-timeout'],
+    ['ERR_NETWORK', 'network-error'],
+    ['unrecognised-private-code', 'unexpected-error'],
+  ])('should map transport code %s without copying the error', async (code, reason) => {
+    const harness = createProtocolHarness({
+      qrFailure: Object.assign(new Error('private-token'), { code }),
+    });
+    const key = await harness.service.createSession();
+    await harness.service.createQr(key).catch(() => undefined);
+    const result = await harness.service.checkQr(key);
+    expect(result).toMatchObject({ failureStage: 'qr-create', failureReason: reason });
+    expect(JSON.stringify(result)).not.toContain('private-token');
+  });
+
+  it.each([
+    'TimeoutError',
+    'AbortError',
+  ])('should classify fetch %s without exposing its message', async (name) => {
+    const failure = Object.assign(new Error('private-url'), { name });
+    const harness = createProtocolHarness({ sessionFailure: failure });
+    const result = await harness.service.createSession().catch((error: unknown) => error);
+    expect(result).toMatchObject({ diagnostics: { failureReason: 'network-timeout' } });
+    expect(JSON.stringify(result)).not.toContain('private-url');
+  });
+
+  it('should retain signed upstream and global codes on a QR creation rejection', async () => {
+    const harness = createProtocolHarness({
+      qrFailure: new QqProtocolError('create-qr', -5, 500, 200),
+    });
+    const key = await harness.service.createSession();
+    const failure = await harness.service.createQr(key).catch((error: unknown) => error);
+    const details = {
+      failureStage: 'qr-create',
+      failureReason: 'upstream-rejected',
+      upstreamHttpStatus: 200,
+      upstreamCode: -5,
+      upstreamGlobalCode: 500,
+    };
+    expect(failure).toMatchObject({ diagnostics: details });
+    expect(await harness.service.checkQr(key)).toMatchObject(details);
+  });
+
+  it('should identify session issue failures after credential exchange', async () => {
+    const harness = createProtocolHarness({
+      sessionResolver: {
+        mode: 'stored',
+        resolve: async () => null,
+        revoke: async () => undefined,
+        issue: async () => {
+          throw new Error('private-cookie');
+        },
+      },
+    });
+    const key = await harness.service.createSession();
+    await harness.service.createQr(key);
+    harness.emit({
+      type: 'cookies',
+      payload: { cookies: { qqmusic_uin: { value: '123' }, qqmusic_key: { value: 'mqtt-key' } } },
+    });
+    await waitFor(async () => (await harness.service.checkQr(key)).code === 800);
+    const result = await harness.service.checkQr(key);
+    expect(result).toMatchObject({
+      code: 800,
+      failureStage: 'session-issue',
+      failureReason: 'unexpected-error',
+    });
+    expect(JSON.stringify(result)).not.toContain('private-cookie');
+  });
+
+  it('should keep successful confirmation free of previous bootstrap diagnostics', async () => {
+    let now = Date.now();
+    let first = true;
+    const harness = createProtocolHarness({
+      now: () => now,
+      qimei: () => {
+        if (first) {
+          first = false;
+          return response({ code: -30002 });
+        }
+        return response({
+          data: JSON.stringify({ code: 0, data: { q16: QIMEI_16, q36: QIMEI_36 } }),
+        });
+      },
+    });
+    await expect(harness.service.createSession()).rejects.toMatchObject({ httpStatus: 502 });
+    now += 30001;
+    const { result } = await login(harness.service, harness.emit);
+    expect(result.code).toBe(803);
+    expect(JSON.stringify(result)).not.toMatch(/failureStage|lastFailure|upstreamCode/);
+    await expect(harness.service.createSession()).resolves.toEqual(expect.any(String));
+  });
+
+  it('should identify a QR already being confirmed without altering its state', async () => {
+    const harness = createProtocolHarness();
+    const key = await harness.service.createSession();
+    await harness.service.createQr(key);
+    harness.emit({ type: 'scanned', payload: null });
+    await expect(harness.service.createSession()).rejects.toMatchObject({
+      httpStatus: 409,
+      diagnostics: { failureStage: 'qr-key', failureReason: 'session-busy' },
+    });
+    expect(await harness.service.checkQr(key)).toMatchObject({ code: 802 });
+  });
+
+  it('should remove untrusted diagnostic fields from a restored QR record', async () => {
+    const service = createQrLoginService({
+      qrSessionRepository: {
+        kind: 'test',
+        save: () => undefined,
+        load: () => [
+          {
+            key: 'key',
+            channel: 'qq',
+            state: 'failed',
+            createdAt: Date.now(),
+            expiresAt: Date.now() + 60000,
+            failureStage: 'private-token',
+            failureReason: 'private-cookie',
+            upstreamCode: 'private-account',
+            upstreamHttpStatus: 999,
+            upstreamGlobalCode: Number.NaN,
+            upstreamSubCode: Number.POSITIVE_INFINITY,
+          },
+        ],
+      },
+    });
+    const result = await service.checkQr('key');
+    expect(result.code).toBe(800);
+    expect(JSON.stringify(result)).not.toMatch(/private-|999/);
+    expect(result).not.toHaveProperty('upstreamHttpStatus', 999);
+  });
+
+  it('should retain QIMEI failure codes in the first error and the subsequent backoff', async () => {
+    const harness = createProtocolHarness({
+      qimei: () => response({ code: -30002, data: JSON.stringify({ code: -99 }) }),
+    });
+    const first = await harness.service.createSession().catch((error: unknown) => error);
+    const repeated = await harness.service.createSession().catch((error: unknown) => error);
+    const details = {
+      failureStage: 'device-bootstrap',
+      failureReason: 'upstream-rejected',
+      upstreamHttpStatus: 200,
+      upstreamCode: -30002,
+      upstreamSubCode: -99,
+    };
+    expect(first).toMatchObject({ httpStatus: 502, diagnostics: details });
+    expect(repeated).toMatchObject({
+      httpStatus: 429,
+      diagnostics: { failureStage: 'qr-key', failureReason: 'local-backoff', lastFailure: details },
+    });
+    expect(harness.calls).toEqual(['GetQimei']);
+  });
+
+  it('should identify GetSession failures without including the upstream body or message', async () => {
+    const failure = Object.assign(new Error('secret-url?cookie=private-cookie'), {
+      response: { status: 503, data: { token: 'private-token' } },
+    });
+    const harness = createProtocolHarness({ sessionFailure: failure });
+    const result = await harness.service.createSession().catch((error: unknown) => error);
+    expect(result).toMatchObject({
+      httpStatus: 502,
+      diagnostics: {
+        failureStage: 'session-bootstrap',
+        failureReason: 'upstream-http-error',
+        upstreamHttpStatus: 503,
+      },
+    });
+    expect(JSON.stringify(result)).not.toMatch(/private-cookie|private-token|secret-url/);
+  });
+
+  it('should preserve QR creation diagnostics in both the thrown error and check response', async () => {
+    const harness = createProtocolHarness({
+      qrFailure: Object.assign(new Error('private-token'), { code: 'ETIMEDOUT' }),
+    });
+    const key = await harness.service.createSession();
+    const failure = await harness.service.createQr(key).catch((error: unknown) => error);
+    const details = { failureStage: 'qr-create', failureReason: 'network-timeout' };
+    expect(failure).toMatchObject({ httpStatus: 502, diagnostics: details });
+    expect(await harness.service.checkQr(key)).toMatchObject(details);
+    expect(JSON.stringify(failure)).not.toContain('private-token');
+  });
+
+  it('should identify MQTT readiness failures as listener failures', async () => {
+    const harness = createProtocolHarness({ listenerReadyFailure: 'MQTT handshake failed' });
+    const key = await harness.service.createSession();
+    const failure = await harness.service.createQr(key).catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      diagnostics: { failureStage: 'mqtt-listener', failureReason: 'mqtt-handshake-failed' },
+    });
+  });
+
+  it('should retain a failed MQTT session as the origin of the next cooldown', async () => {
+    const harness = createProtocolHarness();
+    const key = await harness.service.createSession();
+    await harness.service.createQr(key);
+    harness.failListener();
+    await settleMqttClose();
+    const failure = await harness.service.createSession().catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      httpStatus: 429,
+      diagnostics: {
+        failureStage: 'qr-key',
+        failureReason: 'local-backoff',
+        lastFailure: { failureStage: 'mqtt-listener', failureReason: 'mqtt-websocket-closed' },
+      },
+    });
+  });
+
+  it.each([
+    ['ENOTFOUND', 'dns-error'],
+    ['EAI_AGAIN', 'dns-error'],
+    ['ECONNRESET', 'connection-reset'],
+    ['ECONNREFUSED', 'connection-refused'],
+  ])('should classify fetch cause code %s safely', async (code, reason) => {
+    const failure = Object.assign(new TypeError('fetch failed with private-token'), {
+      cause: { code },
+    });
+    const harness = createProtocolHarness({ sessionFailure: failure });
+    const result = await harness.service.createSession().catch((error: unknown) => error);
+    expect(result).toMatchObject({ diagnostics: { failureReason: reason } });
+    expect(JSON.stringify(result)).not.toContain('private-token');
   });
 });
 
@@ -653,12 +964,78 @@ describe('QQ native QR login service', () => {
         code: 800,
         upstreamCode: 50006,
         retryAfterMs: 30000,
+        failureStage: 'credential-validation',
+        failureReason: 'upstream-rejected',
       }),
     );
     const retryError = await harness.service.createSession().catch((error: unknown) => error);
     expect(retryError).toBeInstanceOf(QrLoginServiceError);
     expect(retryError).toEqual(expect.objectContaining({ httpStatus: 429 }));
     expect((retryError as QrLoginServiceError).retryAfterMs).toBeGreaterThan(29000);
+  });
+
+  it('should report a safe MQTT failure after the QR was scanned', async () => {
+    const harness = createProtocolHarness({ listenerFailure: 'MQTT WebSocket closed' });
+    const key = await harness.service.createSession();
+    await harness.service.createQr(key);
+    harness.emit({ type: 'scanned', payload: {} });
+    harness.failListener();
+    await waitFor(async () => (await harness.service.checkQr(key)).code === 800);
+
+    expect(await harness.service.checkQr(key)).toMatchObject({
+      code: 800,
+      failureStage: 'mqtt-listener',
+      failureReason: 'mqtt-websocket-closed',
+    });
+  });
+
+  it('should not echo unknown listener errors or credentials in QR diagnostics', async () => {
+    const secret = 'qqmusic_key=private-credential';
+    const harness = createProtocolHarness({ listenerFailure: secret });
+    const key = await harness.service.createSession();
+    await harness.service.createQr(key);
+    harness.failListener();
+    await waitFor(async () => (await harness.service.checkQr(key)).code === 800);
+
+    const result = await harness.service.checkQr(key);
+    expect(result).toMatchObject({
+      failureStage: 'mqtt-listener',
+      failureReason: 'unexpected-error',
+    });
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(JSON.stringify(result)).not.toContain(key);
+  });
+
+  it('should identify a QR login rejection delivered by the MQTT event', async () => {
+    const harness = createProtocolHarness();
+    const key = await harness.service.createSession();
+    await harness.service.createQr(key);
+    harness.emit({ type: 'scanned', payload: {} });
+    harness.emit({ type: 'loginFailed', payload: null });
+
+    expect(await harness.service.checkQr(key)).toMatchObject({
+      code: 800,
+      failureStage: 'qr-event',
+      failureReason: 'login-rejected',
+    });
+  });
+
+  it('should identify a missing credential without returning the MQTT payload', async () => {
+    const harness = createProtocolHarness();
+    const key = await harness.service.createSession();
+    await harness.service.createQr(key);
+    harness.emit({
+      type: 'cookies',
+      payload: { cookies: { qqmusic_key: { value: 'private-key' } } },
+    });
+    await waitFor(async () => (await harness.service.checkQr(key)).code === 800);
+
+    const result = await harness.service.checkQr(key);
+    expect(result).toMatchObject({
+      failureStage: 'credential-payload',
+      failureReason: 'missing-credential',
+    });
+    expect(JSON.stringify(result)).not.toContain('private-key');
   });
 
   it('should expose authenticated user and playlist without exposing credentials', async () => {

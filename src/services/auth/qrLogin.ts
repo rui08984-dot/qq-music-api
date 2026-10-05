@@ -134,7 +134,7 @@ export interface QrEventListener {
  * boundary lives here; the live socket and cookie jar stay in `QrSessionRuntime`, which is
  * process-local by nature and can never be persisted or sealed.
  */
-export interface QrSessionRecord {
+export interface QrSessionRecord extends QrFailureDetails {
   key: string;
   channel: QrLoginChannel;
   state: QrState;
@@ -146,8 +146,56 @@ export interface QrSessionRecord {
   qrcodeId?: string;
   imageUrl?: string;
   authToken?: string;
-  upstreamCode?: number;
   retryAfterMs?: number;
+}
+
+type QrFailureStage =
+  | 'qr-key'
+  | 'device-bootstrap'
+  | 'session-bootstrap'
+  | 'qr-create'
+  | 'mqtt-listener'
+  | 'qr-poll'
+  | 'qr-event'
+  | 'credential-payload'
+  | 'credential-exchange'
+  | 'credential-validation'
+  | 'session-issue';
+
+type QrFailureReason =
+  | 'local-backoff'
+  | 'session-busy'
+  | 'upstream-http-error'
+  | 'upstream-rejected'
+  | 'mqtt-websocket-error'
+  | 'mqtt-websocket-closed'
+  | 'mqtt-packet-timeout'
+  | 'mqtt-handshake-timeout'
+  | 'mqtt-handshake-failed'
+  | 'missing-credential'
+  | 'network-timeout'
+  | 'dns-error'
+  | 'connection-reset'
+  | 'connection-refused'
+  | 'network-error'
+  | 'login-rejected'
+  | 'user-canceled'
+  | 'qr-timeout'
+  | 'unexpected-error';
+
+/** Safe failure metadata shared by QR checks and startup errors. */
+export interface QrFailureDetails {
+  failureStage?: QrFailureStage;
+  failureReason?: QrFailureReason;
+  upstreamHttpStatus?: number;
+  upstreamCode?: number;
+  upstreamGlobalCode?: number;
+  upstreamSubCode?: number;
+}
+
+export interface QrFailureDiagnostics extends QrFailureDetails {
+  /** Origin of the current service's cooldown; absent after process restart. */
+  lastFailure?: QrFailureDetails;
 }
 
 /**
@@ -286,11 +334,10 @@ interface QrLoginDependencies {
   randomBytes?: (size: number) => Buffer;
 }
 
-export interface QrCheckResult {
+export interface QrCheckResult extends QrFailureDetails {
   code: 800 | 801 | 802 | 803;
   message: string;
   cookie?: string;
-  upstreamCode?: number;
   retryAfterMs?: number;
 }
 
@@ -728,6 +775,7 @@ export class QrLoginServiceError extends Error {
     public readonly httpStatus: number,
     public readonly retryAfterMs?: number,
     public readonly upstreamCode?: number,
+    public readonly diagnostics: QrFailureDiagnostics = {},
   ) {
     super(message);
     this.name = 'QrLoginServiceError';
@@ -2032,6 +2080,111 @@ const upstreamCodeOf = (error: unknown): number | undefined => {
   return undefined;
 };
 
+/** Only stable, non-sensitive error categories cross the API boundary. */
+const qrFailureReasonOf = (error: unknown): QrFailureReason => {
+  const status = upstreamHttpStatusOf(error);
+  if (status !== undefined && status >= 400) return 'upstream-http-error';
+  if (
+    error instanceof QqProtocolError ||
+    error instanceof WechatQrError ||
+    error instanceof QqDeviceBootstrapError
+  )
+    return 'upstream-rejected';
+  const message = error instanceof Error ? error.message : '';
+  const knownMessages: Record<string, QrFailureReason> = {
+    'MQTT WebSocket error': 'mqtt-websocket-error',
+    'MQTT WebSocket closed': 'mqtt-websocket-closed',
+    'MQTT packet timeout': 'mqtt-packet-timeout',
+    'MQTT handshake timeout': 'mqtt-handshake-timeout',
+    'MQTT handshake failed': 'mqtt-handshake-failed',
+    'MQTT cookies missing login credential': 'missing-credential',
+  };
+  if (Object.hasOwn(knownMessages, message)) return knownMessages[message];
+  const record = dictionaryOf(error);
+  const code = record.code ?? dictionaryOf(record.cause).code;
+  if (error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name))
+    return 'network-timeout';
+  if (code === 'ETIMEDOUT' || code === 'ECONNABORTED') return 'network-timeout';
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'dns-error';
+  if (code === 'ECONNRESET') return 'connection-reset';
+  if (code === 'ECONNREFUSED') return 'connection-refused';
+  if (code === 'ERR_NETWORK') return 'network-error';
+  return 'unexpected-error';
+};
+
+const safeDiagnosticNumber = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined;
+
+const upstreamHttpStatusOf = (error: unknown): number | undefined => {
+  const record = dictionaryOf(error);
+  const status = safeDiagnosticNumber(record.httpStatus ?? dictionaryOf(record.response).status);
+  return status !== undefined && status >= 100 && status <= 599 ? status : undefined;
+};
+
+const QR_FAILURE_STAGES = new Set<string>([
+  'qr-key',
+  'device-bootstrap',
+  'session-bootstrap',
+  'qr-create',
+  'mqtt-listener',
+  'qr-poll',
+  'qr-event',
+  'credential-payload',
+  'credential-exchange',
+  'credential-validation',
+  'session-issue',
+]);
+const QR_FAILURE_REASONS = new Set<string>([
+  'local-backoff',
+  'session-busy',
+  'upstream-http-error',
+  'upstream-rejected',
+  'mqtt-websocket-error',
+  'mqtt-websocket-closed',
+  'mqtt-packet-timeout',
+  'mqtt-handshake-timeout',
+  'mqtt-handshake-failed',
+  'missing-credential',
+  'network-timeout',
+  'dns-error',
+  'connection-reset',
+  'connection-refused',
+  'network-error',
+  'login-rejected',
+  'user-canceled',
+  'qr-timeout',
+  'unexpected-error',
+]);
+
+/** Restored records are untrusted. Select and validate only public diagnostic fields. */
+const failureDetailsOf = (source: QrFailureDetails): QrFailureDetails => ({
+  failureStage:
+    source.failureStage && QR_FAILURE_STAGES.has(source.failureStage)
+      ? source.failureStage
+      : undefined,
+  failureReason:
+    source.failureReason && QR_FAILURE_REASONS.has(source.failureReason)
+      ? source.failureReason
+      : undefined,
+  upstreamHttpStatus: upstreamHttpStatusOf({ httpStatus: source.upstreamHttpStatus }),
+  upstreamCode: safeDiagnosticNumber(source.upstreamCode),
+  upstreamGlobalCode: safeDiagnosticNumber(source.upstreamGlobalCode),
+  upstreamSubCode: safeDiagnosticNumber(source.upstreamSubCode),
+});
+
+const qrFailureDetailsOf = (error: unknown, stage: QrFailureStage): QrFailureDetails => ({
+  failureStage: stage,
+  failureReason: qrFailureReasonOf(error),
+  upstreamHttpStatus: upstreamHttpStatusOf(error),
+  upstreamCode: safeDiagnosticNumber(
+    error instanceof QqDeviceBootstrapError ? error.outerCode : upstreamCodeOf(error),
+  ),
+  upstreamGlobalCode:
+    error instanceof QqProtocolError ? safeDiagnosticNumber(error.globalCode) : undefined,
+  upstreamSubCode:
+    error instanceof QqDeviceBootstrapError ? safeDiagnosticNumber(error.innerCode) : undefined,
+});
+
 type QrListenerFactory = (
   qrcodeId: string,
   onEvent: (event: QrEvent) => void,
@@ -2054,6 +2207,7 @@ class QrLoginServiceImpl implements QrLoginService {
   private creatingSession = false;
   private failureCount = 0;
   private nextQrAllowedAt = 0;
+  private lastQrFailure?: QrFailureDetails;
 
   public constructor(dependencies: QrLoginDependencies) {
     this.http = dependencies.http ?? unavailableHttpClient();
@@ -2130,7 +2284,10 @@ class QrLoginServiceImpl implements QrLoginService {
     this.sessionResolver.cleanup?.();
   }
 
-  private backoff(): number {
+  private backoff(
+    details: QrFailureDetails = { failureStage: 'qr-event', failureReason: 'qr-timeout' },
+  ): number {
+    this.lastQrFailure = failureDetailsOf(details);
     this.failureCount += 1;
     const delay = Math.min(BACKOFF_BASE_MS * 2 ** (this.failureCount - 1), BACKOFF_MAX_MS);
     this.nextQrAllowedAt = this.now() + delay;
@@ -2171,11 +2328,12 @@ class QrLoginServiceImpl implements QrLoginService {
    * Turns a pre-session bootstrap failure into a backed-off client error, so repeated clicks
    * get one 502 with Retry-After and then 429s instead of a stream of upstream calls.
    */
-  private failBootstrap(error: unknown): QrLoginServiceError {
+  private failBootstrap(error: unknown, stage: QrFailureStage): QrLoginServiceError {
     if (error instanceof QrLoginServiceError) return error;
     const bootstrap = error instanceof QqDeviceBootstrapError ? error : null;
     const protocol = error instanceof QqProtocolError ? error : null;
-    const retryAfterMs = this.backoff();
+    const diagnostics = qrFailureDetailsOf(error, stage);
+    const retryAfterMs = this.backoff(diagnostics);
     const upstreamCode = bootstrap?.outerCode ?? protocol?.upstreamCode;
     logger.warn('qq-auth.bootstrap-failed', {
       phase: bootstrap ? 'qimei' : (protocol?.phase ?? 'unknown'),
@@ -2184,26 +2342,34 @@ class QrLoginServiceImpl implements QrLoginService {
       upstreamCode: protocol?.upstreamCode,
       retryAfterMs,
       name: error instanceof Error ? error.name : 'Error',
+      ...diagnostics,
     });
-    return new QrLoginServiceError('Unable to start QR login', 502, retryAfterMs, upstreamCode);
+    return new QrLoginServiceError(
+      'Unable to start QR login',
+      502,
+      retryAfterMs,
+      upstreamCode,
+      diagnostics,
+    );
   }
 
-  private failSession(session: QrSessionRecord, error: unknown): void {
+  private failSession(session: QrSessionRecord, error: unknown, stage: QrFailureStage): void {
     if (terminalState(session.state)) return;
     session.state = 'failed';
-    session.upstreamCode = upstreamCodeOf(error);
-    session.retryAfterMs = this.backoff();
+    Object.assign(session, qrFailureDetailsOf(error, stage));
+    session.retryAfterMs = this.backoff(session);
     this.qrSessionStore.persist();
     logger.warn('qq-auth.session-failed', {
       loginChannel: session.channel,
-      upstreamCode: session.upstreamCode,
       retryAfterMs: session.retryAfterMs,
+      ...failureDetailsOf(session),
       name: error instanceof Error ? error.name : 'Error',
     });
   }
 
   /** QQ App channel: the MQTT payload carries an exchange token, never the final credential. */
   private async exchangeQqLogin(session: QrSessionRecord, payload: unknown): Promise<QqCredential> {
+    session.failureStage = 'credential-payload';
     const cookies = dictionaryOf(dictionaryOf(payload).cookies);
     const musicid = stringOf(dictionaryOf(cookies.qqmusic_uin).value);
     const mqttToken = stringOf(dictionaryOf(cookies.qqmusic_key).value);
@@ -2211,9 +2377,11 @@ class QrLoginServiceImpl implements QrLoginService {
       throw new Error('MQTT cookies missing login credential');
     session.state = 'exchanging';
     const device = this.deviceStore.get();
+    session.failureStage = 'credential-exchange';
     try {
       return await exchangeCredential(this.http, device, session.qrcodeId, musicid, mqttToken);
     } catch (error) {
+      session.failureStage = 'credential-validation';
       const direct = {
         musicid,
         str_musicid: musicid,
@@ -2238,9 +2406,11 @@ class QrLoginServiceImpl implements QrLoginService {
     session: QrSessionRecord,
     payload: unknown,
   ): Promise<QqCredential> {
+    session.failureStage = 'credential-payload';
     const code = stringOf(dictionaryOf(payload).code);
     if (!code) throw new WechatQrError('WeChat authorization missing code');
     session.state = 'exchanging';
+    session.failureStage = 'credential-exchange';
     return exchangeWechatCredential(this.http, this.deviceStore.get(), code);
   }
 
@@ -2249,18 +2419,24 @@ class QrLoginServiceImpl implements QrLoginService {
       session.channel === 'wechat'
         ? await this.exchangeWechatLogin(session, payload)
         : await this.exchangeQqLogin(session, payload);
-    if (session.channel === 'wechat')
+    if (session.channel === 'wechat') {
+      session.failureStage = 'credential-validation';
       credential = await validateWechatCredential(this.http, this.deviceStore.get(), credential);
+    }
+    session.failureStage = 'session-issue';
     const token = await this.sessionResolver.issue({
       credential,
       device: this.deviceStore.get(),
       expiresAt: authSessionExpiryAt(credential, this.now()),
     });
     session.authToken = token;
+    session.failureStage = undefined;
+    session.failureReason = undefined;
     session.state = 'confirmed';
     this.qrSessionStore.persist();
     this.failureCount = 0;
     this.nextQrAllowedAt = 0;
+    this.lastQrFailure = undefined;
     logger.info('qq-auth.login-confirmed', {
       loginChannel: session.channel,
       hasCredential: true,
@@ -2280,12 +2456,19 @@ class QrLoginServiceImpl implements QrLoginService {
       // background exactly as before; a pull channel awaits it inside the same `advance()` so an
       // invocation never ends with the credential exchange still in flight.
       runtime.finalizing = this.finalizeLogin(session, event.payload).catch((error) =>
-        this.failSession(session, error),
+        this.failSession(session, error, session.failureStage ?? 'credential-exchange'),
       );
       void runtime.finalizing;
     } else if (['canceled', 'timeout', 'loginFailed'].includes(event.type ?? '')) {
       session.state = 'expired';
-      session.retryAfterMs = this.backoff();
+      session.failureStage = 'qr-event';
+      session.failureReason =
+        event.type === 'canceled'
+          ? 'user-canceled'
+          : event.type === 'timeout'
+            ? 'qr-timeout'
+            : 'login-rejected';
+      session.retryAfterMs = this.backoff(session);
     }
     this.qrSessionStore.persist();
   }
@@ -2305,7 +2488,8 @@ class QrLoginServiceImpl implements QrLoginService {
       // A dropped long poll is normal; only a run of them fails the session. This is the same
       // tolerance the self-driving WeChat loop applied before it became a pull driver.
       runtime.pollErrors += 1;
-      if (runtime.pollErrors > MAX_CONSECUTIVE_POLL_ERRORS) this.failSession(session, error);
+      if (runtime.pollErrors > MAX_CONSECUTIVE_POLL_ERRORS)
+        this.failSession(session, error, 'qr-poll');
       return;
     }
     for (const event of events) this.onQrEvent(session, event);
@@ -2325,15 +2509,36 @@ class QrLoginServiceImpl implements QrLoginService {
     this.cleanup();
     const retryAfterMs = Math.max(0, this.nextQrAllowedAt - this.now());
     if (retryAfterMs > 0)
-      throw new QrLoginServiceError('QR login is temporarily backed off', 429, retryAfterMs);
+      throw new QrLoginServiceError(
+        'QR login is temporarily backed off',
+        429,
+        retryAfterMs,
+        undefined,
+        {
+          failureStage: 'qr-key',
+          failureReason: 'local-backoff',
+          lastFailure: this.lastQrFailure,
+        },
+      );
     // The concurrency lock and a QR that is mid-confirmation are the only real 409s left.
     if (this.creatingSession || this.confirmingQrExists())
-      throw new QrLoginServiceError('Another QR login is already active', 409);
+      throw new QrLoginServiceError(
+        'Another QR login is already active',
+        409,
+        undefined,
+        undefined,
+        {
+          failureStage: 'qr-key',
+          failureReason: 'session-busy',
+        },
+      );
     this.discardPreemptibleSessions();
     this.creatingSession = true;
+    let stage: QrFailureStage = 'device-bootstrap';
     try {
       const device = this.deviceStore.get();
       if (await ensureQimei(this.http, device, this.now())) this.deviceStore.persist();
+      stage = 'session-bootstrap';
       await refreshAndroidSession(this.http, device);
       this.deviceStore.persist();
       const key = this.random(24).toString('hex');
@@ -2347,7 +2552,7 @@ class QrLoginServiceImpl implements QrLoginService {
       logger.info('qq-auth.qr-session-created', { loginChannel });
       return key;
     } catch (error) {
-      throw this.failBootstrap(error);
+      throw this.failBootstrap(error, stage);
     } finally {
       this.creatingSession = false;
     }
@@ -2382,6 +2587,7 @@ class QrLoginServiceImpl implements QrLoginService {
       throw new QrLoginServiceError('QR session cannot create another code', 409);
     const runtime = this.runtimeFor(session);
     session.state = 'creating';
+    let stage: QrFailureStage = 'qr-create';
     try {
       const qr = await runtime.driver.createQr(session);
       session.identifier = qr.identifier;
@@ -2395,6 +2601,7 @@ class QrLoginServiceImpl implements QrLoginService {
         qrIdentifierLength: qr.identifier.length,
       });
       if (runtime.driver.start) {
+        stage = 'mqtt-listener';
         // The listener deadline is still computed after `expiresIn` narrowed the record, which is
         // exactly the order the pre-driver implementation used.
         const listener = runtime.driver.start(session, {
@@ -2402,7 +2609,7 @@ class QrLoginServiceImpl implements QrLoginService {
           timeoutMs: session.expiresAt - this.now(),
         });
         runtime.listener = listener;
-        void listener.done.catch((error) => this.failSession(session, error));
+        void listener.done.catch((error) => this.failSession(session, error, 'mqtt-listener'));
         await listener.ready;
       } else {
         // A pull channel is scannable the moment the code exists. The self-driving loop it
@@ -2412,8 +2619,14 @@ class QrLoginServiceImpl implements QrLoginService {
       this.qrSessionStore.persist();
       return qr.imageUrl;
     } catch (error) {
-      this.failSession(session, error);
-      throw new QrLoginServiceError('Unable to create QR login', 502, session.retryAfterMs);
+      this.failSession(session, error, stage);
+      throw new QrLoginServiceError(
+        'Unable to create QR login',
+        502,
+        session.retryAfterMs,
+        session.upstreamCode,
+        failureDetailsOf(session),
+      );
     }
   }
 
@@ -2442,8 +2655,8 @@ class QrLoginServiceImpl implements QrLoginService {
     return {
       code: 800,
       message: session.state === 'expired' ? 'QR code expired' : 'QR login failed',
-      ...(session.upstreamCode === undefined ? {} : { upstreamCode: session.upstreamCode }),
       ...(session.retryAfterMs === undefined ? {} : { retryAfterMs: session.retryAfterMs }),
+      ...failureDetailsOf(session),
     };
   }
 

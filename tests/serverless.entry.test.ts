@@ -20,6 +20,28 @@ const call = (
 const bodyOf = async (response: Response): Promise<Record<string, any>> =>
   (await response.json()) as Record<string, any>;
 
+describe('serverless QR startup diagnostics', () => {
+  it('should expose the safe upstream HTTP status when QIMEI bootstrap fails', async () => {
+    const fetchSpy = jest
+      .spyOn(global, 'fetch')
+      .mockResolvedValue(new Response('private-body', { status: 503 }));
+    try {
+      const response = await call('/login/qr/key?channel=wechat');
+      expect(response.status).toBe(502);
+      const body = await bodyOf(response);
+      expect(body).toMatchObject({
+        failureStage: 'device-bootstrap',
+        failureReason: 'upstream-http-error',
+        upstreamHttpStatus: 503,
+      });
+      expect(JSON.stringify(body)).not.toContain('private-body');
+      expect(response.headers.get('retry-after')).toBe('30');
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+});
+
 describe('createRouter', () => {
   const match = createRouter({
     '/login/status': 'status',
