@@ -141,6 +141,31 @@ describe('QQ login controllers', () => {
     expect(response.body).toEqual(expect.objectContaining({ code: 429, retryAfterMs: 31000 }));
   });
 
+  it.each([
+    '/login/qr/key',
+    '/login/qr/create',
+  ])('should serialize safe service diagnostics on %s', async (path) => {
+    const diagnostics = {
+      failureStage: 'qr-key',
+      failureReason: 'local-backoff',
+      lastFailure: {
+        failureStage: 'device-bootstrap',
+        failureReason: 'upstream-rejected',
+        upstreamCode: -30002,
+      },
+    };
+    const failure = Object.assign(new QrLoginServiceError('backed off', 429, 30000), {
+      diagnostics,
+    });
+    mockQrLoginService.createSession.mockRejectedValue(failure);
+    mockQrLoginService.createQr.mockRejectedValue(failure);
+    const result = await request(server).get(path).query({ key: 'private-qr-key' });
+    expect(result.status).toBe(429);
+    expect(result.body).toMatchObject(diagnostics);
+    expect(result.headers['retry-after']).toBe('30');
+    expect(JSON.stringify(result.body)).not.toContain('private-qr-key');
+  });
+
   it('should set an opaque HttpOnly cookie after confirmation and use it for status', async () => {
     mockQrLoginService.checkQr.mockReturnValue({
       code: 803,
