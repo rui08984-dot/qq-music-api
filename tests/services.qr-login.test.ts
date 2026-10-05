@@ -55,6 +55,7 @@ const wxStatusBody = (errcode: number, code = ''): string =>
 
 interface HarnessOptions {
   failCredential?: boolean;
+  listenerFailure?: string;
   /** The exchanged WeChat key is rejected with safe code 1000 until refreshed. */
   wechatNeedsRefresh?: boolean;
   deviceRepository?: DeviceContextRepository;
@@ -381,6 +382,7 @@ const createProtocolHarness = (options: HarnessOptions = {}) => {
     post: post as unknown as AuthHttpClient['post'],
   };
   let emit: ((event: TestQrEvent) => void) | undefined;
+  let rejectListener: ((error: Error) => void) | undefined;
   let closed = false;
   const wechat = createWechatHttpStub(options);
   const service = createQrLoginService({
@@ -396,7 +398,9 @@ const createProtocolHarness = (options: HarnessOptions = {}) => {
       onEvent({ type: 'waiting', payload: null });
       return {
         ready: Promise.resolve(),
-        done: new Promise<void>(() => undefined),
+        done: new Promise<void>((_resolve, reject) => {
+          rejectListener = reject;
+        }),
         close: () => {
           closed = true;
         },
@@ -415,6 +419,10 @@ const createProtocolHarness = (options: HarnessOptions = {}) => {
     emit: (event: TestQrEvent) => {
       if (!emit) throw new Error('listener not started');
       emit(event);
+    },
+    failListener: () => {
+      if (!rejectListener) throw new Error('listener not started');
+      rejectListener(new Error(options.listenerFailure ?? 'MQTT WebSocket closed'));
     },
     wasClosed: () => closed,
   };
@@ -535,12 +543,46 @@ describe('QQ native QR login service', () => {
         code: 800,
         upstreamCode: 50006,
         retryAfterMs: 30000,
+        failureStage: 'credential-validation',
+        failureReason: 'upstream-rejected',
       }),
     );
     const retryError = await harness.service.createSession().catch((error: unknown) => error);
     expect(retryError).toBeInstanceOf(QrLoginServiceError);
     expect(retryError).toEqual(expect.objectContaining({ httpStatus: 429 }));
     expect((retryError as QrLoginServiceError).retryAfterMs).toBeGreaterThan(29000);
+  });
+
+  it('should report a safe MQTT failure after the QR was scanned', async () => {
+    const harness = createProtocolHarness({ listenerFailure: 'MQTT WebSocket closed' });
+    const key = await harness.service.createSession();
+    await harness.service.createQr(key);
+    harness.emit({ type: 'scanned', payload: {} });
+    harness.failListener();
+    await waitFor(async () => (await harness.service.checkQr(key)).code === 800);
+
+    expect(await harness.service.checkQr(key)).toMatchObject({
+      code: 800,
+      failureStage: 'mqtt-listener',
+      failureReason: 'mqtt-websocket-closed',
+    });
+  });
+
+  it('should not echo unknown listener errors or credentials in QR diagnostics', async () => {
+    const secret = 'qqmusic_key=private-credential';
+    const harness = createProtocolHarness({ listenerFailure: secret });
+    const key = await harness.service.createSession();
+    await harness.service.createQr(key);
+    harness.failListener();
+    await waitFor(async () => (await harness.service.checkQr(key)).code === 800);
+
+    const result = await harness.service.checkQr(key);
+    expect(result).toMatchObject({
+      failureStage: 'mqtt-listener',
+      failureReason: 'unexpected-error',
+    });
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(JSON.stringify(result)).not.toContain(key);
   });
 
   it('should expose authenticated user and playlist without exposing credentials', async () => {
