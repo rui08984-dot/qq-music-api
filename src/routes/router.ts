@@ -21,6 +21,18 @@ router.get('/user/albums', context.getUserAlbums);
 router.get('/user/liked-songs', context.getUserLikedSongs);
 router.get('/user/playlist-detail', context.getOwnedPlaylistSongs);
 
+// recommend：五路推荐面向，全部要求扫码登录态
+router.get('/recommend/radio', context.guessRecommend);
+router.get('/recommend/feed', context.recommendFeed);
+router.get('/recommend/radar', context.radarRecommend);
+router.get('/recommend/playlists', context.recommendPlaylists);
+router.get('/recommend/new-songs', context.newSongs);
+router.get('/recommend/similar', context.similarSongs);
+router.get('/like/song', context.likeSong);
+router.get('/unlike/song', context.unlikeSong);
+router.get('/playlist/songs', context.playlistSongs);
+router.get('/playlist/create', context.createPlaylist);
+
 // downloadQQMusic
 router.get('/downloadQQMusic', context.getDownloadQQMusic);
 
