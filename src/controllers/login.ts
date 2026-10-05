@@ -59,6 +59,7 @@ const setServiceError = (ctx: Context, error: unknown): void => {
       message: error.message,
       retryAfterMs: error.retryAfterMs,
       ...(error.upstreamCode === undefined ? {} : { upstreamCode: error.upstreamCode }),
+      ...error.diagnostics,
     };
     return;
   }

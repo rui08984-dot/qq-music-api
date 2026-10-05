@@ -113,7 +113,9 @@ export const createFetchAuthHttpClient = (
       if (!REDIRECT_STATUSES.has(response.status) || !location) {
         // The same window the axios client accepts, so a 4xx surfaces as a rejection either way.
         if (response.status < 200 || response.status >= 400)
-          throw new Error(`QQ auth request failed with status ${response.status}`);
+          throw Object.assign(new Error(`QQ auth request failed with status ${response.status}`), {
+            httpStatus: response.status,
+          });
         return {
           data: (await readBody(response, responseType)) as T,
           status: response.status,
