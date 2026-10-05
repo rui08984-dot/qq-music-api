@@ -11,7 +11,9 @@ import createAuthHttpClient, { type AuthHttpClient } from '../src/services/auth/
 import {
   type AuthSessionRepository,
   createMemoryAuthSessionRepository,
+  createMqttListenOver,
   createQrLoginService,
+  type MqttConnect,
   type QrLoginChannel,
   type QrLoginService,
   QrLoginServiceError,
@@ -56,6 +58,7 @@ const wxStatusBody = (errcode: number, code = ''): string =>
 interface HarnessOptions {
   failCredential?: boolean;
   listenerFailure?: string;
+  mqttConnect?: MqttConnect;
   /** The exchanged WeChat key is rejected with safe code 1000 until refreshed. */
   wechatNeedsRefresh?: boolean;
   deviceRepository?: DeviceContextRepository;
@@ -393,8 +396,10 @@ const createProtocolHarness = (options: HarnessOptions = {}) => {
     createSessionHttp: () => wechat.client,
     now: options.now,
     randomBytes: (size) => Buffer.alloc(size, 7),
-    listen: (_qrcodeId, onEvent) => {
+    listen: (qrcodeId, onEvent, timeoutMs) => {
       emit = onEvent;
+      if (options.mqttConnect)
+        return createMqttListenOver(options.mqttConnect)(qrcodeId, onEvent, timeoutMs);
       onEvent({ type: 'waiting', payload: null });
       return {
         ready: Promise.resolve(),
@@ -450,6 +455,119 @@ const login = async (service: QrLoginService, emit: (event: TestQrEvent) => void
   await waitFor(async () => (await service.checkQr(key)).code === 803);
   return { key, imageUrl, result: await service.checkQr(key) };
 };
+
+// A broker that acknowledges CONNECT/SUBSCRIBE and reports close like a real WebSocket.
+const createClosingMqtt = () => {
+  const sockets: Array<{ close(): void }> = [];
+  const connect: MqttConnect = async (_url, _protocol, handlers) => {
+    let closed = false;
+    const socket = {
+      send: (packet: Uint8Array) => {
+        if (packet[0] >> 4 === 1) handlers.message(Buffer.from([0x20, 0x03, 0, 0, 0]));
+        if (packet[0] >> 4 === 8) handlers.message(Buffer.from([0x90, 0x04, 0, 1, 0, 0]));
+      },
+      close: () => {
+        if (closed) return;
+        closed = true;
+        handlers.close();
+      },
+    };
+    sockets.push(socket);
+    return socket;
+  };
+  return {
+    connect,
+    close: () => {
+      for (const socket of sockets) socket.close();
+    },
+  };
+};
+
+const settleMqttClose = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+describe('QQ QR session teardown', () => {
+  it('should allow a new QR after intentional cancellation closes the MQTT socket', async () => {
+    const mqtt = createClosingMqtt();
+    const harness = createProtocolHarness({ mqttConnect: mqtt.connect });
+    try {
+      const key = await harness.service.createSession();
+      await harness.service.createQr(key);
+      harness.service.cancelSession(key);
+      await settleMqttClose();
+
+      const next = await harness.service.createSession();
+      await harness.service.createQr(next);
+      expect(await harness.service.checkQr(next)).toMatchObject({ code: 801 });
+      harness.service.cancelSession(next);
+    } finally {
+      mqtt.close();
+    }
+  });
+
+  it('should not back off when replacing an unscanned QR closes its MQTT socket', async () => {
+    const mqtt = createClosingMqtt();
+    const harness = createProtocolHarness({ mqttConnect: mqtt.connect });
+    try {
+      const first = await harness.service.createSession();
+      await harness.service.createQr(first);
+      await harness.service.createSession();
+      await settleMqttClose();
+
+      await expect(harness.service.createSession()).resolves.toEqual(expect.any(String));
+    } finally {
+      mqtt.close();
+    }
+  });
+
+  it('should ignore a queued terminal event from a cancelled QR', async () => {
+    const harness = createProtocolHarness();
+    const key = await harness.service.createSession();
+    await harness.service.createQr(key);
+    harness.service.cancelSession(key);
+    harness.emit({ type: 'timeout', payload: null });
+
+    await expect(harness.service.createSession()).resolves.toEqual(expect.any(String));
+  });
+
+  it('should apply only one backoff when expiry cleanup closes the MQTT socket', async () => {
+    const mqtt = createClosingMqtt();
+    let current = Date.now();
+    const harness = createProtocolHarness({ mqttConnect: mqtt.connect, now: () => current });
+    try {
+      const key = await harness.service.createSession();
+      await harness.service.createQr(key);
+      current += 181_000;
+      expect(await harness.service.checkQr(key)).toMatchObject({ code: 800 });
+      await settleMqttClose();
+
+      await expect(harness.service.createSession()).rejects.toMatchObject({
+        httpStatus: 429,
+        retryAfterMs: 30000,
+      });
+    } finally {
+      mqtt.close();
+    }
+  });
+
+  it('should still back off when a live MQTT connection closes unexpectedly', async () => {
+    const mqtt = createClosingMqtt();
+    const harness = createProtocolHarness({ mqttConnect: mqtt.connect });
+    try {
+      const key = await harness.service.createSession();
+      await harness.service.createQr(key);
+      mqtt.close();
+      await settleMqttClose();
+
+      expect(await harness.service.checkQr(key)).toMatchObject({
+        code: 800,
+        message: 'QR login failed',
+      });
+      await expect(harness.service.createSession()).rejects.toMatchObject({ httpStatus: 429 });
+    } finally {
+      mqtt.close();
+    }
+  });
+});
 
 describe('QQ native QR login service', () => {
   it('should move through waiting, scanned, and confirmed states', async () => {
