@@ -586,6 +586,48 @@ describe('QQ QR session teardown', () => {
 
 describe('QQ QR startup diagnostics', () => {
   it.each([
+    99, 100, 599, 600, 200.5,
+  ])('should validate restored HTTP status %s independently of signed upstream codes', async (status) => {
+    const service = createQrLoginService({
+      qrSessionRepository: {
+        kind: 'test',
+        save: () => undefined,
+        load: () => [
+          {
+            key: 'key',
+            channel: 'qq',
+            state: 'failed',
+            createdAt: Date.now(),
+            expiresAt: Date.now() + 60000,
+            failureStage: 'qr-create',
+            failureReason: 'upstream-rejected',
+            upstreamHttpStatus: status,
+            upstreamCode: -30002,
+            upstreamGlobalCode: 0,
+            upstreamSubCode: -99,
+          },
+        ],
+      },
+    });
+    const result = await service.checkQr('key');
+    expect(result.upstreamCode).toBe(-30002);
+    expect(result.upstreamHttpStatus).toBe(status === 100 || status === 599 ? status : undefined);
+  });
+
+  it('should classify a thrown primitive as unknown without exposing its content', async () => {
+    const harness = createProtocolHarness({
+      qimei: () => {
+        throw 'private-token';
+      },
+    });
+    const result = await harness.service.createSession().catch((error: unknown) => error);
+    expect(result).toMatchObject({
+      diagnostics: { failureStage: 'device-bootstrap', failureReason: 'unexpected-error' },
+    });
+    expect(JSON.stringify(result)).not.toContain('private-token');
+  });
+
+  it.each([
     ['MQTT WebSocket error', 'mqtt-websocket-error'],
     ['MQTT WebSocket closed', 'mqtt-websocket-closed'],
     ['MQTT packet timeout', 'mqtt-packet-timeout'],

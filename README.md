@@ -100,7 +100,7 @@ qqMusic.configureAuthSessionRepository({
 
 服务同一时间只允许一个 QR 会话。新会话会接管尚未扫码的旧会话；上游要求退避时，响应会提供 `Retry-After`。
 
-`/login/qr/check` 返回 `800` 时，可附带 `failureStage`、`failureReason`、`upstreamCode` 和 `retryAfterMs`，供调用方记录失败原因；不会返回原始异常或登录凭证。
+扫码失败响应提供阶段、原因和退避来源，供调用方生成脱敏诊断报告。字段说明见[接口文档](./docs/README.md#扫码失败诊断)。
 
 ## API Explorer
 

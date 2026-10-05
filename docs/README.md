@@ -1298,7 +1298,20 @@ songs: [
 
 服务只允许一个并行 QR。上游拒绝（包括安全数字码 `50006`）会保留为 `upstreamCode`，并返回 `retryAfterMs` / `Retry-After`，调用方应等待后重新出码。
 
-`/login/qr/check` 返回 `800` 时，还可能附 `failureStage` 和 `failureReason`。两者是固定代码，例如 `mqtt-listener` / `mqtt-websocket-closed` 或 `credential-validation` / `upstream-rejected`；未知错误统一为 `unexpected-error`，不回传异常原文或凭证。调用方可连同 `upstreamCode`、`retryAfterMs` 一起写入脱敏诊断日志。
+#### 扫码失败诊断
+
+`/login/qr/key`、`/login/qr/create` 的错误响应和 `/login/qr/check` 的 `800` 响应可附以下字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `failureStage` | 失败阶段，如 `device-bootstrap`、`session-bootstrap`、`mqtt-listener`、`credential-validation` |
+| `failureReason` | 固定原因代码，如 `dns-error`、`network-timeout`、`upstream-http-error`；未知错误为 `unexpected-error` |
+| `upstreamHttpStatus` | 上游 HTTP 状态，与本服务返回的 `502` 等状态分开记录 |
+| `upstreamCode`、`upstreamGlobalCode`、`upstreamSubCode` | 上游数字码，分别对应业务码、musicu 顶层码和 QIMEI 内层码；不推断官方含义 |
+| `retryAfterMs` | 需等待的毫秒数，HTTP 错误响应同时提供 `Retry-After` |
+| `lastFailure` | 本地退避 `429` 的前一次失败摘要，结构同上述诊断字段；重启或切换服务实例后不保留 |
+
+本地退避使用 `qr-key` / `local-backoff`，会话仍在确认中使用 `qr-key` / `session-busy`。未取得的字段不返回；异常原文、响应正文和登录凭证不进入诊断摘要。
 
 #### 实际验收与故障诊断
 
@@ -1357,7 +1370,7 @@ songs: [
 
 QIMEI 与 device session 因此跨进程重启复用（重启后日志为 `source: 'restored'` 与 `qimei-result source: 'cache'`，不再重新注册装置）。多实例部署请各自指定 `QQ_AUTH_STATE_PATH`，不要共用同一份装置身份。
 
-建立 QR session 之前的失败（QIMEI 或 GetSession）会套用指数退避：首次返回 502 + `Retry-After`，body 附安全数字码 `upstreamCode`；随后的请求返回 429，避免用户连点打出连续 500 或连续冲击上游。
+建立 QR session 之前的失败（QIMEI 或 GetSession）会套用指数退避：首次返回 `502` 和失败摘要，随后的请求返回 `429`、`Retry-After` 和 `lastFailure`。取消或替换未扫码的二维码不计退避；过期清理只计一次。
 
 日志只记录外层／内层 code、数据类型与 q16／q36 长度。不得硬读 probe 的 `test-results`，也不要记录 QIMEI、完整响应 body、QR ID、cookie、token、`musickey`、MQTT token 或 Android 装置值。
 
