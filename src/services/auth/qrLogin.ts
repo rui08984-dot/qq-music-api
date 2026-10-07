@@ -350,6 +350,8 @@ export interface QrLoginService {
   cancelSession(key: string): void;
   getLoginStatus(token?: string): Promise<Dictionary | null>;
   getUserDetail(token?: string): Promise<Dictionary | null>;
+  /** 见实现处注释：旧式 CGI 写操作（评论点赞）要的 `Cookie` 头，服务端内部流转用。 */
+  getCookieHeader(token?: string): Promise<string | null>;
   getUserPlaylists(token?: string, uin?: string): Promise<Dictionary | null>;
   getUserAlbums(token?: string, offset?: number, limit?: number): Promise<Dictionary | null>;
   getUserLikedSongs(token?: string, offset?: number, limit?: number): Promise<Dictionary | null>;
@@ -2980,6 +2982,16 @@ class QrLoginServiceImpl implements QrLoginService {
   public async getUserDetail(token?: string): Promise<Dictionary | null> {
     const auth = await this.authFor(token);
     return auth ? withCredentialRejectionMapped(() => getLoginProfile(this.http, auth)) : null;
+  }
+
+  /**
+   * 旧式 CGI（如评论点赞 fcg_global_comment_h5）用 **cookie** 认人，而不是 musicu 的 token 通道。
+   * 这里把登录态里的凭证导出成一条 `Cookie` 头给需要写评论的服务用；解析不到会话就回 null，
+   * 调用方据此按未登录处理。凭证只在服务端流转，绝不进任何 HTTP 响应体（与 AuthSession 同源约束）。
+   */
+  public async getCookieHeader(token?: string): Promise<string | null> {
+    const auth = await this.authFor(token);
+    return auth ? credentialCookieHeader(auth.credential) : null;
   }
 
   public async getUserPlaylists(token?: string, uin?: string): Promise<Dictionary | null> {
