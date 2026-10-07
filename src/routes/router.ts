@@ -23,6 +23,7 @@ router.get('/user/playlist-detail', context.getOwnedPlaylistSongs);
 
 // recommend：五路推荐面向，全部要求扫码登录态
 router.get('/recommend/radio', context.guessRecommend);
+router.get('/recommend/radio/dislike', context.radioDislike);
 router.get('/recommend/feed', context.recommendFeed);
 router.get('/recommend/radar', context.radarRecommend);
 router.get('/recommend/playlists', context.recommendPlaylists);

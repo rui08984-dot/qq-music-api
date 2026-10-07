@@ -10,6 +10,12 @@ export interface GuessRecommendParams {
   num?: number;
 }
 
+export interface RadioDislikeParams {
+  token?: string;
+  /** 单曲的数字 songId（mid 转换在调用方完成）。 */
+  songId?: number;
+}
+
 export interface RecommendFeedParams {
   token?: string;
   page?: number;
@@ -62,6 +68,9 @@ export interface SimilarSongsParams {
 export const getGuessRecommend = ({ token, num }: GuessRecommendParams = {}) =>
   qrLoginService.getGuessRecommend(token, num);
 
+export const radioDislike = ({ token, songId }: RadioDislikeParams = {}) =>
+  qrLoginService.getRadioDislike(token, songId);
+
 export const getRecommendFeed = ({
   token,
   page,
@@ -100,6 +109,7 @@ export const createPlaylist = ({ token, dirName }: CreatePlaylistParams = {}) =>
 
 export default {
   getGuessRecommend,
+  radioDislike,
   getRecommendFeed,
   getRadarRecommend,
   getRecommendPlaylists,
