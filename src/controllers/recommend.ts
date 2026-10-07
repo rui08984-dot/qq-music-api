@@ -25,6 +25,24 @@ export const guessRecommend = async (ctx: Context): Promise<void> => {
   ctx.body = { code: 200, tracks, total: tracks.length };
 };
 
+/** 电台「不感兴趣」：把这首单曲从猜你喜欢画像里拉黑。写操作，header 只认裸 token。 */
+export const radioDislike = async (ctx: Context): Promise<void> => {
+  const { songid } = getTypedQuery<{ songid?: string }>(ctx);
+  const songId = Number(songid);
+  if (!Number.isFinite(songId) || songId <= 0) {
+    ctx.status = 400;
+    ctx.body = { code: 400, message: 'songid is required' };
+    return;
+  }
+  const data = await services.recommend.radioDislike({
+    token: getAuthToken(ctx),
+    songId,
+  });
+  if (!data) return unauthorized(ctx);
+  ctx.status = 200;
+  ctx.body = { code: 200, data };
+};
+
 /** 首页推荐信息流。`v_cache` 决定翻页还是换一批。 */
 export const recommendFeed = async (ctx: Context): Promise<void> => {
   const { page, direction, s_num, v_cache } = getTypedQuery<{

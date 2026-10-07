@@ -358,6 +358,7 @@ export interface QrLoginService {
     params?: OwnedPlaylistSongsParams,
   ): Promise<Dictionary | null>;
   getGuessRecommend(token?: string, num?: number): Promise<Dictionary | null>;
+  getRadioDislike(token?: string, songId?: number): Promise<Dictionary | null>;
   getRecommendFeed(
     token?: string,
     params?: { page?: number; direction?: number; sNum?: number; vCache?: string[] },
@@ -2052,6 +2053,26 @@ const getCreatePlaylist = async (
 const RADIO_GUESS_YOU_LIKE = 99;
 
 /**
+ * 电台「不感兴趣」反馈（feedback_radio）。与 get_radio_track 同族同电台 id；
+ * `dis_like_type: 1` 是社区多个客户端共用的单曲拉黑值。失败（含上游拒收）由
+ * callMusicu 统一抛 QqProtocolError，调用方按普通失败处理。
+ */
+const getRadioDislike = async (
+  http: AuthHttpClient,
+  auth: AuthSession,
+  songId: number,
+): Promise<Dictionary> =>
+  callMusicu(
+    http,
+    auth.device,
+    'radio-dislike',
+    'music.radioProxy.MbTrackRadioSvr',
+    'feedback_radio',
+    { radio_type: RADIO_GUESS_YOU_LIKE, song_id: songId, dis_like_type: 1 },
+    auth.credential,
+  );
+
+/**
  * 猜你喜欢 —— 也是刷歌的唯一来源。
  * `num` 上游默认只有 5，要连续刷必须显式调大；这里封顶 100，避免一次把整个电台拉空。
  */
@@ -3042,6 +3063,15 @@ class QrLoginServiceImpl implements QrLoginService {
     const auth = await this.authFor(token);
     return auth
       ? withCredentialRejectionMapped(() => getLikeSong(this.http, auth, Math.floor(songId ?? 0)))
+      : null;
+  }
+
+  public async getRadioDislike(token?: string, songId?: number): Promise<Dictionary | null> {
+    const auth = await this.authFor(token);
+    return auth
+      ? withCredentialRejectionMapped(() =>
+          getRadioDislike(this.http, auth, Math.floor(songId ?? 0)),
+        )
       : null;
   }
 

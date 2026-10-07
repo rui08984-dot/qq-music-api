@@ -99,6 +99,12 @@ export const apiExplorerBaseRoutes: ApiExplorerBaseRoute[] = [
   },
   { name: 'getDownloadQQMusic', method: 'GET', routePath: '/downloadQQMusic', category: 'Song' },
   { name: 'guessRecommend', method: 'GET', routePath: '/recommend/radio', category: 'Recommend' },
+  {
+    name: 'radioDislike',
+    method: 'GET',
+    routePath: '/recommend/radio/dislike',
+    category: 'Recommend',
+  },
   { name: 'recommendFeed', method: 'GET', routePath: '/recommend/feed', category: 'Recommend' },
   { name: 'radarRecommend', method: 'GET', routePath: '/recommend/radar', category: 'Recommend' },
   {
