@@ -46,7 +46,7 @@ export default async (ctx: Context) => {
   // 🔴 实测边界（2026-10-08）：这套 cookie/g_tk/loginh5key 全带齐后，上游对**安卓扫码凭证**
   // 仍回业务失败（不带 g_tk 是 1101 invalid token，带了是 code -1）——这个 h5 CGI 要的是
   // 网页端登录族。要真接通点赞：要么加 web 登录通道，要么用已证实的 musicu 评论模块；
-  // 别在参数组合上继续猜。前端目前没声明 likeComment 能力，这条分支是未来的地基。
+  // 也试过 musicu 原生通道（music.commentComment.CommentComment 等五组候选签名的读调用）：统一回 500003 subcode 860100001——分不清"模块名不对"还是"这套凭证族无此模块准入"，没有可靠签名就继续别猜参数。  // 别在参数组合上继续猜。前端目前没声明 likeComment 能力，这条分支是未来的地基。
   const isPraise = Number(cmd) === 3;
   const cookie = isPraise ? await qrLoginService.getCookieHeader(getAuthToken(ctx)) : null;
   if (isPraise && !cookie) {
