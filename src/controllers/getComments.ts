@@ -21,7 +21,11 @@ export default async (ctx: Context) => {
     biztype = 1,
     rootcommentid = !pagenum && '',
   } = ctx.query;
-  const checkrootcommentid = !pagenum ? true : !!rootcommentid;
+  // koa 的 query 值永远是字符串：`pagenum=0` 传进来是 '0'（truthy），原来的 `!pagenum`
+  // 会把首页误判成"需要 rootcommentid 的翻页"，于是没有游标的首屏请求被 400 拒收。
+  // 显式转成数字再判首页。
+  const pageNumNum = Number(pagenum) || 0;
+  const checkrootcommentid = pageNumNum === 0 ? true : !!rootcommentid;
 
   const params = Object.assign({
     cid,
@@ -29,7 +33,7 @@ export default async (ctx: Context) => {
     biztype,
     topid: id,
     cmd,
-    pagenum,
+    pagenum: pageNumNum,
     pagesize,
     lasthotcommentid: rootcommentid,
   });
